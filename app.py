@@ -728,10 +728,10 @@ def check_free_tier_limits(config, account_config, compute_client, block_client,
                 if cfg:
                     total_ocpus += int(cfg.ocpus or 0)
                     total_memory += int(cfg.memory_in_gbs or 0)
-        if total_ocpus + requested_ocpus > 2:
-            return False, f"A1 OCPUs would exceed 2 (used {total_ocpus} + requested {requested_ocpus})"
-        if total_memory + requested_memory > 12:
-            return False, f"A1 memory would exceed 12 GB (used {total_memory} + requested {requested_memory})"
+        if total_ocpus + requested_ocpus > 4:
+            return False, f"A1 OCPUs would exceed 4 (used {total_ocpus} + requested {requested_ocpus})"
+        if total_memory + requested_memory > 24:
+            return False, f"A1 memory would exceed 24 GB (used {total_memory} + requested {requested_memory})"
         return True, ""
     return True, ""
 
@@ -828,13 +828,13 @@ def get_free_tier_usage(config, compute_client, block_client, identity_client):
                 total_ocpus += ocpus
                 total_memory += memory
                 arm_instances.append({'name': inst.display_name, 'ocpus': ocpus, 'memory': memory, 'state': inst.lifecycle_state})
-    ocpus_remaining = max(0, 2 - total_ocpus)
-    memory_remaining = max(0, 12 - total_memory)
+    ocpus_remaining = max(0, 4 - total_ocpus)
+    memory_remaining = max(0, 24 - total_memory)
     all_instances = list_all_instances(config, compute_client, identity_client, network_client)
     return {
         'storage': {'used_gb': total_storage, 'limit_gb': 200, 'remaining_gb': storage_remaining, 'percent': round((total_storage / 200) * 100, 1) if total_storage > 0 else 0},
         'micro': {'used': micro_count, 'limit': 2, 'remaining': micro_remaining, 'percent': round((micro_count / 2) * 100, 1) if micro_count > 0 else 0},
-        'arm': {'used_ocpus': total_ocpus, 'limit_ocpus': 2, 'remaining_ocpus': ocpus_remaining, 'used_memory_gb': total_memory, 'limit_memory_gb': 12, 'remaining_memory_gb': memory_remaining, 'instances': arm_instances, 'ocpu_percent': round((total_ocpus / 2) * 100, 1) if total_ocpus > 0 else 0, 'memory_percent': round((total_memory / 12) * 100, 1) if total_memory > 0 else 0},
+        'arm': {'used_ocpus': total_ocpus, 'limit_ocpus': 4, 'remaining_ocpus': ocpus_remaining, 'used_memory_gb': total_memory, 'limit_memory_gb': 24, 'remaining_memory_gb': memory_remaining, 'instances': arm_instances, 'ocpu_percent': round((total_ocpus / 4) * 100, 1) if total_ocpus > 0 else 0, 'memory_percent': round((total_memory / 24) * 100, 1) if total_memory > 0 else 0},
         'all_instances': all_instances
     }
 
