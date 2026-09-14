@@ -12,8 +12,13 @@ services:
       - PORT=5000
       - APP_PASSWORD=${APP_PASSWORD:-}
       - TELEGRAM_BOT_TOKEN=${TELEGRAM_BOT_TOKEN:-8662502307:AAF_5VwOGGK5tyEoEU6ujqcRLZulcgL9dXU}
-      - TELEGRAM_CHAT_ID=${TELEGRAM_CHAT_ID:-}
+      - TELEGRAM_CHAT_ID=${TELEGRAM_CHAT_ID:-5540796673}
       - MAX_ATTEMPTS=${MAX_ATTEMPTS:-1000}
+      - TZ=Asia/Jakarta
+    volumes:
+      - ./app.py:/app/app.py:ro
+      - ./templates:/app/templates:ro
+      - ./active_config.json:/app/active_config.json
     # Strictly limit container resources to ensure minimal host impact
     deploy:
       resources:

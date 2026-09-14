@@ -7,3 +7,6 @@ __pycache__/
 *.pyc
 venv/
 .venv/
+active_config.json
+*.json
+!templates/*.json

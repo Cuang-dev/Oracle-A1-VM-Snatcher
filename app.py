@@ -6,6 +6,8 @@ import threading
 import datetime
 import functools
 import requests
+import html
+import json
 from flask import Flask, render_template, request, jsonify, Response
 from collections import deque
 import oci
@@ -16,6 +18,9 @@ from zoneinfo import ZoneInfo, available_timezones
 def get_user_tz(tz_name=None):
     if tz_name and tz_name in available_timezones():
         return ZoneInfo(tz_name)
+    tz_env = os.environ.get("TZ", "Asia/Jakarta")
+    if tz_env in available_timezones():
+        return ZoneInfo(tz_env)
     return ZoneInfo("UTC")
 
 def get_user_time(tz_name=None):
@@ -50,7 +55,21 @@ if not ADMIN_PASSWORD:
 
 MAX_ATTEMPTS = int(os.environ.get('MAX_ATTEMPTS', 1000))
 DEFAULT_BOT_TOKEN = os.environ.get('TELEGRAM_BOT_TOKEN', '8662502307:AAF_5VwOGGK5tyEoEU6ujqcRLZulcgL9dXU')
-DEFAULT_CHAT_ID = os.environ.get('TELEGRAM_CHAT_ID', '')
+DEFAULT_CHAT_ID = os.environ.get('TELEGRAM_CHAT_ID', '5540796673')
+# Active Telegram Chat Tracker
+tg_chat_lock = threading.Lock()
+active_telegram_chat_id = DEFAULT_CHAT_ID
+
+def set_active_chat_id(cid):
+    global active_telegram_chat_id
+    if cid:
+        with tg_chat_lock:
+            active_telegram_chat_id = str(cid).strip()
+
+def get_active_chat_id():
+    with tg_chat_lock:
+        return active_telegram_chat_id or DEFAULT_CHAT_ID
+
 
 # ---- Shared state ----
 global_logs = deque(maxlen=1000)
@@ -60,6 +79,32 @@ automation_lock = threading.Lock()
 automation_running = False
 automation_shape = None
 stop_event = threading.Event()
+
+# Structured automation metrics tracker
+automation_stats = {
+    "start_time": None,
+    "total_attempts": 0,
+    "attempts_today": 0,
+    "today_date": None,
+    "last_attempt_time": None,
+    "last_status": "Idle",
+    "target_name": "AlwaysFree-ARM",
+    "shape": "VM.Standard.A1.Flex",
+    "ocpus": 4,
+    "memory_gb": 24,
+    "boot_volume_gb": 50,
+    "region": "ap-singapore-1",
+    "ad": "",
+    "oci_username": None,
+    "capacity_busy_count": 0,
+    "rate_limit_count": 0,
+    "error_count": 0,
+    "success": False,
+    "instance_id": None,
+    "public_ip": None,
+    "daily_reports_sent": set(),
+}
+stats_lock = threading.Lock()
 
 # Per-request timezone
 _user_tz = threading.local()
@@ -97,19 +142,124 @@ def _send_live_log_to_telegram(line):
         if now - tg_live_last_sent < tg_live_min_interval:
             return
         tg_live_last_sent = now
+        token = tg_live_bot_token
+        chat_id = tg_live_chat_id
     try:
         clean_msg = line
         if len(clean_msg) > 4000:
             clean_msg = clean_msg[:4000] + "..."
-        url = f"https://api.telegram.org/bot{tg_live_bot_token}/sendMessage"
+        url = f"https://api.telegram.org/bot{token}/sendMessage"
         payload = {
-            "chat_id": tg_live_chat_id,
-            "text": f"<code>{clean_msg}</code>",
+            "chat_id": chat_id,
+            "text": f"<code>{html.escape(clean_msg)}</code>",
             "parse_mode": "HTML"
         }
         requests.post(url, json=payload, timeout=5)
     except Exception:
         pass
+
+
+def generate_daily_report_text(tz_name=None):
+    tz = get_user_tz(tz_name or get_current_tz())
+    now_dt = datetime.datetime.now(tz)
+    with stats_lock:
+        st = automation_stats.copy()
+    with automation_lock:
+        running = automation_running
+
+    state_badge = "🟢 <b>Actively Snatching (24/7)</b>" if running else "⏸️ <b>Idle / Stopped</b>"
+
+    uptime_str = "0m"
+    if st.get("start_time"):
+        elapsed_sec = int(time.time() - st["start_time"])
+        days = elapsed_sec // 86400
+        hours = (elapsed_sec % 86400) // 3600
+        minutes = (elapsed_sec % 3600) // 60
+        if days > 0:
+            uptime_str = f"{days}d {hours}h {minutes}m"
+        elif hours > 0:
+            uptime_str = f"{hours}h {minutes}m"
+        else:
+            uptime_str = f"{minutes}m"
+
+    with logs_lock:
+        recent = list(global_logs)[-3:]
+    logs_clean = "\n".join(f"• <code>{html.escape(l)}</code>" for l in recent) if recent else "<i>No recent logs</i>"
+
+    report = (
+        "📅 <b>Oracle A1 VM Snatcher — Daily Update</b>\n\n"
+        f"• <b>Status:</b> {state_badge}\n"
+        f"• <b>Target:</b> {html.escape(str(st.get('target_name', 'AlwaysFree-ARM')))}\n"
+        f"• <b>Specs:</b> {st.get('ocpus', 4)} OCPUs | {st.get('memory_gb', 24)} GB RAM | {st.get('boot_volume_gb', 50)} GB Boot\n"
+        f"• <b>Shape:</b> <code>{html.escape(str(st.get('shape', 'VM.Standard.A1.Flex')))}</code>\n"
+        f"• <b>Region:</b> {html.escape(str(st.get('region', 'ap-singapore-1')))} ({html.escape(str(st.get('ad', 'AD-1'))[:30])})\n"
+        f"• <b>Uptime:</b> {uptime_str}\n"
+        f"• <b>Report Time:</b> {now_dt.strftime('%A, %d %B %Y %H:%M:%S (%Z)')}\n\n"
+        "📊 <b>24-Hour Snatcher Statistics:</b>\n"
+        f"• <b>Total Attempts:</b> {st.get('total_attempts', 0):,} requests\n"
+        f"• <b>Attempts Today:</b> {st.get('attempts_today', 0):,} requests\n"
+        f"• <b>Out of Capacity (500):</b> {st.get('capacity_busy_count', 0):,}\n"
+        f"• <b>Rate Limited (429):</b> {st.get('rate_limit_count', 0):,}\n"
+        f"• <b>Latest Result:</b> {html.escape(str(st.get('last_status', 'Pending')))}\n\n"
+        f"📋 <b>Recent Activity Snippet:</b>\n{logs_clean}\n\n"
+        "💡 <i>The snatcher is actively querying Oracle for freed capacity. The instant a slot opens up, your VM will be claimed and you will receive an immediate alert with your public IP!</i>\n\n"
+        "<b>Available Commands:</b>\n"
+        "• <code>/logs</code> - View latest 10 logs (or <code>/logs 20</code>)\n"
+        "• <code>/status</code> - View current real-time status\n"
+        "• <code>/daily</code> - Force send daily update report\n"
+        "• <code>/livelog on</code> - Stream all attempts live to Telegram"
+    )
+    return report
+
+
+def generate_status_text(tz_name=None):
+    tz = get_user_tz(tz_name or get_current_tz())
+    now_dt = datetime.datetime.now(tz)
+    with stats_lock:
+        st = automation_stats.copy()
+    with automation_lock:
+        running = automation_running
+
+    state_badge = "🟢 <b>Actively Snatching (24/7)</b>" if running else "⏸️ <b>Idle / Stopped</b>"
+
+    uptime_str = "0m"
+    if st.get("start_time"):
+        elapsed_sec = int(time.time() - st["start_time"])
+        days = elapsed_sec // 86400
+        hours = (elapsed_sec % 86400) // 3600
+        minutes = (elapsed_sec % 3600) // 60
+        uptime_str = f"{days}d {hours}h {minutes}m" if days > 0 else (f"{hours}h {minutes}m" if hours > 0 else f"{minutes}m")
+
+    with logs_lock:
+        recent = list(global_logs)[-3:]
+    logs_clean = "\n".join(f"• <code>{html.escape(l)}</code>" for l in recent) if recent else "<i>No logs yet</i>"
+
+    return (
+        "🤖 <b>Oracle A1 VM Snatcher Status</b>\n\n"
+        f"• <b>State:</b> {state_badge}\n"
+        f"• <b>Target:</b> {html.escape(str(st.get('target_name', 'AlwaysFree-ARM')))}\n"
+        f"• <b>Shape:</b> <code>{html.escape(str(st.get('shape', 'VM.Standard.A1.Flex')))}</code> (4 OCPU, 24 GB RAM)\n"
+        f"• <b>Region:</b> {html.escape(str(st.get('region', 'ap-singapore-1')))}\n"
+        f"• <b>Attempts:</b> {st.get('total_attempts', 0):,} total ({st.get('attempts_today', 0):,} today)\n"
+        f"• <b>Uptime:</b> {uptime_str}\n"
+        f"• <b>Time:</b> {now_dt.strftime('%Y-%m-%d %H:%M:%S')}\n\n"
+        f"<b>Latest Activity:</b>\n{logs_clean}\n\n"
+        "Send <code>/logs</code> for more logs, or <code>/daily</code> for daily statistics report."
+    )
+
+
+def generate_logs_text(num_lines=10):
+    with logs_lock:
+        logs_list = list(global_logs)
+    if not logs_list:
+        return "📋 <b>Recent Activity Logs:</b>\n\n<i>No logs recorded yet. Snatcher is initializing...</i>"
+    recent = logs_list[-min(num_lines, 30):]
+    logs_clean = "\n\n".join(f"• <code>{html.escape(l)}</code>" for l in recent)
+    return (
+        f"📋 <b>Recent Activity Logs (last {len(recent)} entries):</b>\n\n"
+        f"{logs_clean}\n\n"
+        "<i>Send /logs 20 for more lines, or /livelog on to stream all attempts.</i>"
+    )
 
 
 def build_config(data):
@@ -861,6 +1011,7 @@ def resolve_telegram_chat(bot_token=None, explicit_chat_id=None):
                     chat = update["callback_query"]["message"].get("chat")
                 if chat and "id" in chat:
                     cid = str(chat["id"])
+                    set_active_chat_id(cid)
                     title = chat.get("title") or chat.get("username") or chat.get("first_name") or cid
                     return cid, title
     except Exception as e:
@@ -879,8 +1030,17 @@ def send_telegram_message(bot_token, chat_id, message, tz_name=None):
         if data.get("ok"):
             return True, "Message sent"
         else:
-            return False, data.get("description", "Unknown Telegram error")
+            err_desc = data.get("description", "Unknown Telegram error")
+            if "can't parse entities" in err_desc.lower() or "tag" in err_desc.lower() or "bad request" in err_desc.lower():
+                plain_text = re.sub(r'<[^>]+>', '', message)
+                fb_payload = {"chat_id": chat_id, "text": plain_text}
+                fb_resp = requests.post(url, json=fb_payload, timeout=10).json()
+                if fb_resp.get("ok"):
+                    return True, "Message sent (plain text fallback)"
+            add_log(f"Telegram sendMessage error: {err_desc}")
+            return False, err_desc
     except Exception as e:
+        add_log(f"Telegram sendMessage exception: {str(e)}")
         return False, str(e)
 
 
@@ -1008,6 +1168,34 @@ def run_automated_creation(config, account_config, compute_client, network_clien
         add_log(f"Launching provisioning loop for '{target_name}'...")
         attempts = 0
         success = False
+        last_summary_time = time.time()
+        start_time = time.time()
+
+        with stats_lock:
+            automation_stats["running"] = True
+            automation_stats["start_time"] = start_time
+            automation_stats["target_name"] = target_name
+            automation_stats["shape"] = account_config.get('shape', 'VM.Standard.A1.Flex')
+            automation_stats["ocpus"] = account_config.get('ocpus', 4)
+            automation_stats["memory_gb"] = account_config.get('memory', 24)
+            automation_stats["boot_volume_gb"] = boot_gb
+            automation_stats["region"] = target_region
+            automation_stats["ad"] = ad_list[0] if ad_list else ''
+            automation_stats["oci_username"] = oci_username
+            automation_stats["last_status"] = "Starting launch attempts..."
+
+        # Send initial start alert to Telegram
+        init_chat = telegram_chat_id or get_active_chat_id()
+        if telegram_bot_token and init_chat:
+            start_msg = (
+                "🚀 <b>Oracle A1 VM Snatcher Started!</b>\n\n"
+                f"• <b>Target:</b> {target_name}\n"
+                f"• <b>Shape:</b> {account_config.get('shape', 'VM.Standard.A1.Flex')} ({account_config.get('ocpus', 4)} OCPU, {account_config.get('memory', 24)} GB RAM)\n"
+                f"• <b>Region:</b> {target_region}\n"
+                f"• <b>Time:</b> {format_user_time(tz_name=get_current_tz())}\n\n"
+                "<i>Monitoring capacity continuously 24/7. You will receive regular daily updates and an immediate alert the moment capacity is freed!</i>"
+            )
+            send_telegram_message(telegram_bot_token, init_chat, start_msg, get_current_tz())
         ad_index = 0
         import random as _random
         if len(ad_list) > 1:
@@ -1015,6 +1203,37 @@ def run_automated_creation(config, account_config, compute_client, network_clien
             add_log(f"AD order randomized for faster discovery: {', '.join(ad_list)}")
         while True:
             attempts += 1
+            current_chat = telegram_chat_id or get_active_chat_id()
+            now = time.time()
+            now_date_str = datetime.datetime.now(get_user_tz(get_current_tz())).strftime('%Y-%m-%d')
+            with stats_lock:
+                automation_stats["total_attempts"] += 1
+                if automation_stats["today_date"] != now_date_str:
+                    automation_stats["today_date"] = now_date_str
+                    automation_stats["attempts_today"] = 1
+                else:
+                    automation_stats["attempts_today"] += 1
+                automation_stats["last_attempt_time"] = now
+                if 'current_ad' in locals() and current_ad:
+                    automation_stats["ad"] = current_ad
+
+            # Send periodic status update every 6 hours or every 50 attempts
+            if telegram_bot_token and current_chat and ((now - last_summary_time >= 21600) or (attempts > 1 and attempts % 50 == 0)):
+                last_summary_time = now
+                elapsed_min = int((now - start_time) / 60)
+                elapsed_hr = elapsed_min // 60
+                elapsed_rem_min = elapsed_min % 60
+                summary_msg = (
+                    "📊 <b>OCI Snatcher Status Update</b>\n\n"
+                    "• <b>Status:</b> Actively Retrying\n"
+                    f"• <b>Attempts:</b> {attempts}\n"
+                    f"• <b>Target Shape:</b> {account_config.get('shape', 'VM.Standard.A1.Flex')} ({account_config.get('ocpus', 4)} OCPU, {account_config.get('memory', 24)} GB RAM)\n"
+                    f"• <b>Region:</b> {target_region} ({current_ad if 'current_ad' in locals() else 'AD-1'})\n"
+                    f"• <b>Uptime:</b> {elapsed_hr}h {elapsed_rem_min}m\n"
+                    f"• <b>Time:</b> {format_user_time(tz_name=get_current_tz())}\n\n"
+                    "<i>Capacity currently busy in your region. Monitoring 24/7 for available slots.</i>"
+                )
+                send_telegram_message(telegram_bot_token, current_chat, summary_msg, get_current_tz())
             if stop_event.is_set():
                 add_log("Provisioning loop stopped by user.")
                 break
@@ -1022,6 +1241,7 @@ def run_automated_creation(config, account_config, compute_client, network_clien
             if len(ad_list) > 1:
                 add_log(f"Attempt {attempts}: trying AD '{current_ad}'...")
             instance_details.availability_domain = current_ad
+            is_429 = False
             try:
                 add_log(f"Attempt {attempts}: sending instance launch request...")
                 response = compute_client.launch_instance(instance_details)
@@ -1034,7 +1254,14 @@ def run_automated_creation(config, account_config, compute_client, network_clien
                 elif ip_err:
                     add_log(f"Could not get public IP: {ip_err}")
                 success = True
-                if telegram_bot_token and telegram_chat_id:
+                with stats_lock:
+                    automation_stats["success"] = True
+                    automation_stats["instance_id"] = instance_id
+                    automation_stats["public_ip"] = public_ip
+                    automation_stats["last_status"] = "Successfully Provisioned!"
+
+                target_tg_chat = telegram_chat_id or get_active_chat_id()
+                if telegram_bot_token and target_tg_chat:
                     instance_name = account_config.get('display_name', 'AlwaysFree-Bot')
                     shape = account_config.get('shape', 'Unknown')
                     region = config.get('region', 'unknown')
@@ -1052,7 +1279,7 @@ def run_automated_creation(config, account_config, compute_client, network_clien
                         f"<b>Status:</b> Running\n\n"
                         f"Your Always Free instance has been successfully provisioned!"
                     )
-                    tg_ok, tg_err = send_telegram_message(telegram_bot_token, telegram_chat_id, tg_msg, get_current_tz())
+                    tg_ok, tg_err = send_telegram_message(telegram_bot_token, target_tg_chat, tg_msg, get_current_tz())
                     if tg_ok:
                         add_log("Telegram success alert sent.")
                     else:
@@ -1063,7 +1290,17 @@ def run_automated_creation(config, account_config, compute_client, network_clien
                 code = getattr(e, 'code', 'N/A')
                 status = getattr(e, 'status', 'N/A')
                 add_log(f"Debug -> ServiceError code={code}, status={status}, msg={e.message[:120]}")
-                if "Out of capacity" in msg or status in (500, 429, 503, 504):
+                if "TooManyRequests" in msg or status == 429:
+                    is_429 = True
+                    with stats_lock:
+                        automation_stats["rate_limit_count"] += 1
+                        automation_stats["last_status"] = "Too Many Requests (429 Rate Limited)"
+                    user_info = f" [user: {oci_username}]" if oci_username else ""
+                    add_log(f"Rate limited (429) in '{target_region}'.{user_info} Backing off...")
+                elif "Out of capacity" in msg or status in (500, 503, 504):
+                    with stats_lock:
+                        automation_stats["capacity_busy_count"] += 1
+                        automation_stats["last_status"] = "Out of host capacity (500)"
                     user_info = f" [user: {oci_username}]" if oci_username else ""
                     add_log(f"Capacity busy in '{target_region}' AD '{current_ad}'.{user_info} Retrying...")
                     if len(ad_list) > 1:
@@ -1071,6 +1308,9 @@ def run_automated_creation(config, account_config, compute_client, network_clien
                         next_ad = ad_list[ad_index % len(ad_list)]
                         add_log(f"Switching to next AD: '{next_ad}'")
                 elif "NotAuthorizedOrNotFound" in msg or "Authorization failed" in msg or status == 404:
+                    with stats_lock:
+                        automation_stats["error_count"] += 1
+                        automation_stats["last_status"] = "Auth/NotFound error"
                     add_log(f"Auth/NotFound error — possible causes:")
                     add_log(f"  1. Image {image_id[:25]}... not found in AD {current_ad}")
                     add_log(f"  2. Shape {account_config['shape']} not available in this AD")
@@ -1082,6 +1322,9 @@ def run_automated_creation(config, account_config, compute_client, network_clien
                         continue
                     break
                 else:
+                    with stats_lock:
+                        automation_stats["error_count"] += 1
+                        automation_stats["last_status"] = f"OCI Error: {e.message[:50]}"
                     add_log(f"OCI API error: {e.message}")
                     if len(ad_list) > 1:
                         ad_index += 1
@@ -1102,13 +1345,18 @@ def run_automated_creation(config, account_config, compute_client, network_clien
             actual_delay = retry_delay
             if randomize_delay:
                 actual_delay = random.randint(random_min, random_max)
+            if is_429:
+                actual_delay = max(actual_delay, 50)
+                add_log(f"Rate limit backoff: extending wait to {actual_delay}s")
+            else:
                 add_log(f"Dynamic retry: waiting {actual_delay}s (randomized {random_min}-{random_max}s)")
             if stop_event.wait(actual_delay):
                 add_log("Provisioning loop stopped while waiting.")
                 break
         if not success:
             add_log("Provisioning loop ended without success.")
-            if telegram_bot_token and telegram_chat_id:
+            target_tg_chat = telegram_chat_id or get_active_chat_id()
+            if telegram_bot_token and target_tg_chat:
                 user_line = f"<b>User:</b> {oci_username}\n" if oci_username else ""
                 user_time = format_user_time(tz_name=get_current_tz())
                 tg_msg = (
@@ -1118,7 +1366,7 @@ def run_automated_creation(config, account_config, compute_client, network_clien
                     f"<b>Region:</b> {config.get('region', 'unknown')}\n"
                     f"<b>Time:</b> {user_time}"
                 )
-                send_telegram_message(telegram_bot_token, telegram_chat_id, tg_msg, get_current_tz())
+                send_telegram_message(telegram_bot_token, target_tg_chat, tg_msg, get_current_tz())
     except Exception as e:
         msg = str(e)
         if "Remote end closed connection" in msg or "Connection aborted" in msg:
@@ -1134,11 +1382,13 @@ def run_automated_creation(config, account_config, compute_client, network_clien
                 f"Automation engine failure:\n{msg[:200]}\n"
                 f"<b>Time:</b> {user_time}"
             )
-            send_telegram_message(telegram_bot_token, telegram_chat_id, tg_msg, get_current_tz())
+            send_telegram_message(telegram_bot_token, target_tg_chat, tg_msg, get_current_tz())
     finally:
         with automation_lock:
             automation_running = False
             automation_shape = None
+        with stats_lock:
+            automation_stats["running"] = False
 
 
 @app.route('/api/free-tier-status', methods=['POST'])
@@ -1222,6 +1472,13 @@ def auto_launch():
             daemon=True
         )
         thread.start()
+        # Persist active configuration to disk for automatic restart recovery
+        for cfg_file in ('/app/active_config.json', 'active_config.json'):
+            try:
+                with open(cfg_file, 'w') as f:
+                    json.dump(data, f)
+            except Exception:
+                pass
         return jsonify({'success': True, 'message': 'Provisioning loop started.' + (' Live Telegram logging enabled.' if tg_live_enabled else '')})
     except Exception as e:
         with automation_lock:
@@ -1423,3 +1680,261 @@ def api_delete_all_instances():
 if __name__ == '__main__':
     port = int(os.environ.get("PORT", 5000))
     app.run(host='0.0.0.0', port=port)
+
+
+# ---- Auto-Resume Saved Configuration on Container Start ----
+def auto_resume_saved_config():
+    for cfg_file in ('/app/active_config.json', 'active_config.json'):
+        if os.path.exists(cfg_file):
+            try:
+                with open(cfg_file) as f:
+                    data = json.load(f)
+                if data and data.get('user') and data.get('private_key'):
+                    add_log(f"Auto-resuming saved snatcher configuration from {cfg_file}...")
+                    config = build_config(data)
+                    oci.config.validate_config(config)
+                    requested_shape = data.get('shape', 'VM.Standard.A1.Flex')
+                    bot_token = data.get('telegram_bot_token', '').strip() or DEFAULT_BOT_TOKEN
+                    chat_id = data.get('telegram_chat_id', '').strip() or DEFAULT_CHAT_ID
+                    if chat_id:
+                        set_active_chat_id(chat_id)
+                    with automation_lock:
+                        global automation_running, automation_shape
+                        if automation_running:
+                            return
+                        automation_running = True
+                        automation_shape = requested_shape
+                        stop_event.clear()
+                    compute_client = oci.core.ComputeClient(config)
+                    network_client = oci.core.VirtualNetworkClient(config)
+                    identity_client = oci.identity.IdentityClient(config)
+                    retry_delay = int(data.get('retry_delay', 60))
+                    randomize_delay = data.get('randomize_delay', True)
+                    random_min = int(data.get('random_min', 25))
+                    random_max = int(data.get('random_max', 60))
+                    tz = data.get('timezone', 'Asia/Jakarta')
+                    threading.Thread(
+                        target=run_automated_creation,
+                        args=(config, data, compute_client, network_client, identity_client,
+                              retry_delay, randomize_delay, random_min, random_max,
+                              bot_token, chat_id, tz),
+                        daemon=True
+                    ).start()
+                    add_log("Snatcher provisioning loop auto-resumed successfully.")
+                    break
+            except Exception as e:
+                add_log(f"Auto-resume notice: {e}")
+
+
+# ---- Dedicated Periodic Updater (Daily Updates & Heartbeats) ----
+def start_periodic_updater():
+    def _updater():
+        add_log("Periodic daily updater thread initialized.")
+        last_heartbeat = time.time()
+        while True:
+            try:
+                time.sleep(30)
+                now = time.time()
+                tz = get_user_tz(get_current_tz())
+                now_dt = datetime.datetime.now(tz)
+                current_date_str = now_dt.strftime('%Y-%m-%d')
+                current_hour = now_dt.hour
+                current_min = now_dt.minute
+
+                # Daily updates twice a day: Morning (09:00 WIB) and Evening (21:00 WIB)
+                slot_id = None
+                if current_hour == 9 and current_min < 15:
+                    slot_id = f"{current_date_str}-morning"
+                elif current_hour == 21 and current_min < 15:
+                    slot_id = f"{current_date_str}-evening"
+
+                chat_id = get_active_chat_id()
+                token = DEFAULT_BOT_TOKEN
+
+                if slot_id and token and chat_id:
+                    with stats_lock:
+                        already_sent = slot_id in automation_stats["daily_reports_sent"]
+                    if not already_sent:
+                        with stats_lock:
+                            automation_stats["daily_reports_sent"].add(slot_id)
+                        report_msg = generate_daily_report_text()
+                        ok, err = send_telegram_message(token, chat_id, report_msg)
+                        if ok:
+                            add_log(f"Daily update ({slot_id}) sent to Telegram chat {chat_id}")
+                        else:
+                            add_log(f"Failed to send daily update ({slot_id}): {err}")
+                        last_heartbeat = now
+
+                # Heartbeat check every 6 hours if running
+                if now - last_heartbeat >= 21600 and token and chat_id:
+                    with automation_lock:
+                        is_running = automation_running
+                    if is_running:
+                        last_heartbeat = now
+                        heartbeat_msg = generate_status_text()
+                        send_telegram_message(token, chat_id, heartbeat_msg)
+                        add_log(f"6-hour status heartbeat sent to Telegram chat {chat_id}")
+            except Exception as e:
+                time.sleep(10)
+
+    t = threading.Thread(target=_updater, daemon=True, name="PeriodicDailyUpdater")
+    t.start()
+
+
+# ---- Interactive Telegram Bot Listener ----
+def start_telegram_bot_listener():
+    def _listener():
+        add_log("Telegram interactive bot listener started.")
+        last_offset = 0
+        # Initialize last_offset with latest updates so we don't replay ancient messages
+        try:
+            token = DEFAULT_BOT_TOKEN
+            if token:
+                init_res = requests.get(f"https://api.telegram.org/bot{token}/getUpdates",
+                                        params={"offset": -1, "timeout": 5}, timeout=10).json()
+                if init_res.get("ok") and init_res.get("result"):
+                    last_offset = init_res["result"][-1]["update_id"] + 1
+                    add_log(f"Telegram listener offset synchronized to {last_offset}")
+        except Exception as e:
+            add_log(f"Telegram offset sync note: {e}")
+
+        while True:
+            try:
+                token = DEFAULT_BOT_TOKEN
+                if not token:
+                    time.sleep(10)
+                    continue
+                url = f"https://api.telegram.org/bot{token}/getUpdates"
+                params = {"timeout": 25, "allowed_updates": ["message"]}
+                if last_offset:
+                    params["offset"] = last_offset
+                
+                try:
+                    resp = requests.get(url, params=params, timeout=35).json()
+                except (requests.exceptions.ReadTimeout, requests.exceptions.Timeout):
+                    continue
+                except Exception:
+                    time.sleep(3)
+                    continue
+
+                if resp.get("ok") and resp.get("result"):
+                    for update in resp["result"]:
+                        update_id = update["update_id"]
+                        if update_id >= last_offset:
+                            last_offset = update_id + 1
+                        msg = update.get("message")
+                        if not msg:
+                            continue
+                        chat = msg.get("chat", {})
+                        chat_id = str(chat.get("id"))
+                        set_active_chat_id(chat_id)
+                        text = (msg.get("text") or "").strip()
+                        text_lower = text.lower()
+                        user_name = chat.get("first_name") or "William"
+                        add_log(f"Telegram msg received from {user_name} ({chat_id}): '{text}'")
+
+                        # 1. Logs commands
+                        if text_lower in ("/logs", "logs", "/log", "log", "show logs", "send logs", "view logs", "give me logs", "get logs") or "log" in text_lower:
+                            num = 10
+                            parts = text.split()
+                            if len(parts) > 1 and parts[-1].isdigit():
+                                num = max(3, min(int(parts[-1]), 30))
+                            reply = generate_logs_text(num_lines=num)
+                            send_telegram_message(token, chat_id, reply)
+
+                        # 2. Daily updates / Report command
+                        elif text_lower in ("/daily", "daily", "/report", "report", "summary", "/summary", "daily update", "daily updates", "update"):
+                            reply = generate_daily_report_text()
+                            send_telegram_message(token, chat_id, reply)
+
+                        # 3. Status commands
+                        elif text_lower in ("/status", "status", "/stat", "stat", "how is it going", "hows it going", "info", "state", "check"):
+                            reply = generate_status_text()
+                            send_telegram_message(token, chat_id, reply)
+
+                        # 4. Live log toggle commands
+                        elif text_lower in ("/livelog on", "livelog on", "/stream on", "stream on"):
+                            global tg_live_enabled, tg_live_bot_token, tg_live_chat_id
+                            with tg_live_lock:
+                                tg_live_enabled = True
+                                tg_live_bot_token = token
+                                tg_live_chat_id = chat_id
+                            reply = (
+                                "📡 <b>Live Telegram Logging: ENABLED</b>\n\n"
+                                "You will now receive real-time log updates as each provisioning attempt occurs.\n\n"
+                                "Send <code>/livelog off</code> anytime to stop streaming."
+                            )
+                            send_telegram_message(token, chat_id, reply)
+
+                        elif text_lower in ("/livelog off", "livelog off", "/stream off", "stream off"):
+                            with tg_live_lock:
+                                tg_live_enabled = False
+                            reply = (
+                                "🔕 <b>Live Telegram Logging: DISABLED</b>\n\n"
+                                "Live logs paused. You will still receive daily updates and the instant success alert when the VM is created.\n\n"
+                                "Send <code>/logs</code> anytime to view recent activity."
+                            )
+                            send_telegram_message(token, chat_id, reply)
+
+                        # 5. Ping
+                        elif text_lower in ("/ping", "ping"):
+                            send_telegram_message(token, chat_id, "🏓 <b>Pong!</b> Snatcher service is active, responsive, and monitoring 24/7.")
+
+                        # 6. Start / Help
+                        elif text_lower in ("/help", "help", "/start", "start"):
+                            reply = (
+                                f"👋 <b>Hello {user_name}!</b>\n\n"
+                                "Welcome to <b>Oracle A1 VM Snatcher</b> bot.\n"
+                                "Your Always Free Ampere A1 (4 OCPU, 24 GB RAM) snatcher is actively monitored.\n\n"
+                                "<b>📋 Available Commands:</b>\n"
+                                "• <code>/logs</code> - View latest retry logs (or <code>/logs 20</code>)\n"
+                                "• <code>/status</code> - Current status & attempt counter\n"
+                                "• <code>/daily</code> - Trigger full daily update report\n"
+                                "• <code>/livelog on</code> - Stream live retry logs to this chat\n"
+                                "• <code>/livelog off</code> - Turn off live log streaming\n"
+                                "• <code>/ping</code> - Check bot responsiveness\n\n"
+                                "☀️ <b>Daily Updates:</b> Automatically delivered twice daily (09:00 & 21:00 WIB).\n"
+                                "🚀 <b>VM Capture Alert:</b> Sent immediately with public IP once created!"
+                            )
+                            send_telegram_message(token, chat_id, reply)
+
+                        # 7. Fallback for ANY other message
+                        else:
+                            with automation_lock:
+                                is_running = automation_running
+                            status_badge = "🟢 <b>Actively Snatching (24/7)</b>" if is_running else "⏸️ <b>Idle / Stopped</b>"
+                            with logs_lock:
+                                recent = list(global_logs)[-3:]
+                            logs_clean = "\n".join(f"• <code>{html.escape(l)}</code>" for l in recent) if recent else "<i>No logs yet</i>"
+                            reply = (
+                                f"🤖 <b>Oracle A1 VM Snatcher:</b> {status_badge}\n\n"
+                                f"<b>Latest Activity:</b>\n{logs_clean}\n\n"
+                                "<b>Quick Commands:</b>\n"
+                                "• Send <code>/logs</code> for 10 recent attempt logs\n"
+                                "• Send <code>/daily</code> for full daily update report\n"
+                                "• Send <code>/livelog on</code> to stream all attempts live"
+                            )
+                            send_telegram_message(token, chat_id, reply)
+            except Exception as e:
+                add_log(f"Telegram listener error: {str(e)}")
+                time.sleep(3)
+
+    t = threading.Thread(target=_listener, daemon=True, name="TelegramBotListener")
+    t.start()
+
+
+# Auto-initialize services once per process
+_services_started = False
+_services_lock = threading.Lock()
+
+def init_background_services():
+    global _services_started
+    with _services_lock:
+        if _services_started:
+            return
+        _services_started = True
+    auto_resume_saved_config()
+    start_periodic_updater()
+    start_telegram_bot_listener()
+
+init_background_services()
