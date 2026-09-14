@@ -1,0 +1,25 @@
+services:
+  oracle-snatcher:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: oracle-a1-vm-snatcher:latest
+    container_name: oracle-a1-vm-snatcher
+    restart: unless-stopped
+    ports:
+      - "${PORT:-5000}:5000"
+    environment:
+      - PORT=5000
+      - APP_PASSWORD=${APP_PASSWORD:-}
+      - TELEGRAM_BOT_TOKEN=${TELEGRAM_BOT_TOKEN:-8662502307:AAF_5VwOGGK5tyEoEU6ujqcRLZulcgL9dXU}
+      - TELEGRAM_CHAT_ID=${TELEGRAM_CHAT_ID:-}
+      - MAX_ATTEMPTS=${MAX_ATTEMPTS:-1000}
+    # Strictly limit container resources to ensure minimal host impact
+    deploy:
+      resources:
+        limits:
+          cpus: '0.50'
+          memory: 256M
+        reservations:
+          cpus: '0.05'
+          memory: 64M
