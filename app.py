@@ -1027,7 +1027,7 @@ def get_main_keyboard():
             [{"text": "🔕 Live Logs OFF"}, {"text": "🏓 Ping"}]
         ],
         "resize_keyboard": True,
-        "is_persistent": True
+        "is_persistent": False
     }
 
 
