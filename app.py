@@ -1019,12 +1019,44 @@ def resolve_telegram_chat(bot_token=None, explicit_chat_id=None):
     return None, None
 
 
-def send_telegram_message(bot_token, chat_id, message, tz_name=None):
+def get_main_keyboard():
+    return {
+        "keyboard": [
+            [{"text": "📊 Status"}, {"text": "📋 Recent Logs"}],
+            [{"text": "📅 Daily Report"}, {"text": "📡 Live Logs ON"}],
+            [{"text": "🔕 Live Logs OFF"}, {"text": "🏓 Ping"}]
+        ],
+        "resize_keyboard": True,
+        "is_persistent": True
+    }
+
+
+def register_bot_commands(token=None):
+    token = token or DEFAULT_BOT_TOKEN
+    if not token:
+        return
+    try:
+        commands = [
+            {"command": "status", "description": "📊 Real-time snatcher status & specs"},
+            {"command": "logs", "description": "📋 View latest 10 activity logs"},
+            {"command": "daily", "description": "📅 Comprehensive 24h daily summary"},
+            {"command": "livelog", "description": "📡 Stream live logs to chat (on/off)"},
+            {"command": "ping", "description": "🏓 Check bot responsiveness"},
+            {"command": "help", "description": "❓ View command guide & features"}
+        ]
+        requests.post(f"https://api.telegram.org/bot{token}/setMyCommands", json={"commands": commands}, timeout=10)
+    except Exception as e:
+        add_log(f"Telegram setMyCommands note: {e}")
+
+
+def send_telegram_message(bot_token, chat_id, message, tz_name=None, reply_markup=None):
     if not bot_token or not chat_id:
         return False, "Missing bot token or chat ID"
     try:
         url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
         payload = {"chat_id": chat_id, "text": message, "parse_mode": "HTML"}
+        if reply_markup is not False:
+            payload["reply_markup"] = reply_markup or get_main_keyboard()
         response = requests.post(url, json=payload, timeout=10)
         data = response.json()
         if data.get("ok"):
@@ -1034,6 +1066,8 @@ def send_telegram_message(bot_token, chat_id, message, tz_name=None):
             if "can't parse entities" in err_desc.lower() or "tag" in err_desc.lower() or "bad request" in err_desc.lower():
                 plain_text = re.sub(r'<[^>]+>', '', message)
                 fb_payload = {"chat_id": chat_id, "text": plain_text}
+                if reply_markup is not False:
+                    fb_payload["reply_markup"] = reply_markup or get_main_keyboard()
                 fb_resp = requests.post(url, json=fb_payload, timeout=10).json()
                 if fb_resp.get("ok"):
                     return True, "Message sent (plain text fallback)"
@@ -1833,27 +1867,17 @@ def start_telegram_bot_listener():
                         user_name = chat.get("first_name") or "William"
                         add_log(f"Telegram msg received from {user_name} ({chat_id}): '{text}'")
 
-                        # 1. Logs commands
-                        if text_lower in ("/logs", "logs", "/log", "log", "show logs", "send logs", "view logs", "give me logs", "get logs") or "log" in text_lower:
-                            num = 10
-                            parts = text.split()
-                            if len(parts) > 1 and parts[-1].isdigit():
-                                num = max(3, min(int(parts[-1]), 30))
-                            reply = generate_logs_text(num_lines=num)
-                            send_telegram_message(token, chat_id, reply)
+                        # Intent matching with robust button and emoji support
+                        is_live_on = ("live" in text_lower or "stream" in text_lower) and "on" in text_lower
+                        is_live_off = ("live" in text_lower or "stream" in text_lower) and ("off" in text_lower or "stop" in text_lower)
+                        is_daily = "daily" in text_lower or "report" in text_lower or "summary" in text_lower
+                        is_logs = ("log" in text_lower) and not is_live_on and not is_live_off
+                        is_status = "status" in text_lower or "stat" in text_lower or "state" in text_lower or "check" in text_lower or "how" in text_lower
+                        is_ping = "ping" in text_lower
+                        is_help = "help" in text_lower or "start" in text_lower or "menu" in text_lower
 
-                        # 2. Daily updates / Report command
-                        elif text_lower in ("/daily", "daily", "/report", "report", "summary", "/summary", "daily update", "daily updates", "update"):
-                            reply = generate_daily_report_text()
-                            send_telegram_message(token, chat_id, reply)
-
-                        # 3. Status commands
-                        elif text_lower in ("/status", "status", "/stat", "stat", "how is it going", "hows it going", "info", "state", "check"):
-                            reply = generate_status_text()
-                            send_telegram_message(token, chat_id, reply)
-
-                        # 4. Live log toggle commands
-                        elif text_lower in ("/livelog on", "livelog on", "/stream on", "stream on"):
+                        # 1. Live Log Toggle Commands
+                        if is_live_on:
                             global tg_live_enabled, tg_live_bot_token, tg_live_chat_id
                             with tg_live_lock:
                                 tg_live_enabled = True
@@ -1861,39 +1885,59 @@ def start_telegram_bot_listener():
                                 tg_live_chat_id = chat_id
                             reply = (
                                 "📡 <b>Live Telegram Logging: ENABLED</b>\n\n"
-                                "You will now receive real-time log updates as each provisioning attempt occurs.\n\n"
-                                "Send <code>/livelog off</code> anytime to stop streaming."
+                                "You will now receive real-time updates as each provisioning attempt occurs.\n\n"
+                                "Tap <b>🔕 Live Logs OFF</b> below anytime to stop streaming."
                             )
                             send_telegram_message(token, chat_id, reply)
 
-                        elif text_lower in ("/livelog off", "livelog off", "/stream off", "stream off"):
+                        elif is_live_off:
                             with tg_live_lock:
                                 tg_live_enabled = False
                             reply = (
                                 "🔕 <b>Live Telegram Logging: DISABLED</b>\n\n"
                                 "Live logs paused. You will still receive daily updates and the instant success alert when the VM is created.\n\n"
-                                "Send <code>/logs</code> anytime to view recent activity."
+                                "Tap <b>📋 Recent Logs</b> anytime to view recent activity."
                             )
                             send_telegram_message(token, chat_id, reply)
 
+                        # 2. Daily Report / Summary
+                        elif is_daily:
+                            reply = generate_daily_report_text()
+                            send_telegram_message(token, chat_id, reply)
+
+                        # 3. Recent Logs
+                        elif is_logs:
+                            num = 10
+                            parts = text.split()
+                            if len(parts) > 1 and parts[-1].isdigit():
+                                num = max(3, min(int(parts[-1]), 30))
+                            reply = generate_logs_text(num_lines=num)
+                            send_telegram_message(token, chat_id, reply)
+
+                        # 4. Status Check
+                        elif is_status:
+                            reply = generate_status_text()
+                            send_telegram_message(token, chat_id, reply)
+
                         # 5. Ping
-                        elif text_lower in ("/ping", "ping"):
+                        elif is_ping:
                             send_telegram_message(token, chat_id, "🏓 <b>Pong!</b> Snatcher service is active, responsive, and monitoring 24/7.")
 
-                        # 6. Start / Help
-                        elif text_lower in ("/help", "help", "/start", "start"):
+                        # 6. Start / Help / Menu
+                        elif is_help:
                             reply = (
                                 f"👋 <b>Hello {user_name}!</b>\n\n"
                                 "Welcome to <b>Oracle A1 VM Snatcher</b> bot.\n"
                                 "Your Always Free Ampere A1 (4 OCPU, 24 GB RAM) snatcher is actively monitored.\n\n"
-                                "<b>📋 Available Commands:</b>\n"
-                                "• <code>/logs</code> - View latest retry logs (or <code>/logs 20</code>)\n"
-                                "• <code>/status</code> - Current status & attempt counter\n"
-                                "• <code>/daily</code> - Trigger full daily update report\n"
-                                "• <code>/livelog on</code> - Stream live retry logs to this chat\n"
-                                "• <code>/livelog off</code> - Turn off live log streaming\n"
-                                "• <code>/ping</code> - Check bot responsiveness\n\n"
-                                "☀️ <b>Daily Updates:</b> Automatically delivered twice daily (09:00 & 21:00 WIB).\n"
+                                "<b>🔘 Quick Menu Options:</b>\n"
+                                "Use the persistent keyboard buttons below for 1-tap commands:\n\n"
+                                "• <b>📊 Status</b> - Real-time snatcher state & specs\n"
+                                "• <b>📋 Recent Logs</b> - View latest 10 attempt logs\n"
+                                "• <b>📅 Daily Report</b> - Comprehensive 24h summary report\n"
+                                "• <b>📡 Live Logs ON</b> - Stream attempts live to this chat\n"
+                                "• <b>🔕 Live Logs OFF</b> - Pause live streaming\n"
+                                "• <b>🏓 Ping</b> - Test bot responsiveness\n\n"
+                                "☀️ <b>Daily Updates:</b> Automatically sent twice daily (09:00 & 21:00 WIB).\n"
                                 "🚀 <b>VM Capture Alert:</b> Sent immediately with public IP once created!"
                             )
                             send_telegram_message(token, chat_id, reply)
@@ -1909,10 +1953,7 @@ def start_telegram_bot_listener():
                             reply = (
                                 f"🤖 <b>Oracle A1 VM Snatcher:</b> {status_badge}\n\n"
                                 f"<b>Latest Activity:</b>\n{logs_clean}\n\n"
-                                "<b>Quick Commands:</b>\n"
-                                "• Send <code>/logs</code> for 10 recent attempt logs\n"
-                                "• Send <code>/daily</code> for full daily update report\n"
-                                "• Send <code>/livelog on</code> to stream all attempts live"
+                                "Tap any button on the menu below to check status or logs:"
                             )
                             send_telegram_message(token, chat_id, reply)
             except Exception as e:
@@ -1933,6 +1974,7 @@ def init_background_services():
         if _services_started:
             return
         _services_started = True
+    register_bot_commands()
     auto_resume_saved_config()
     start_periodic_updater()
     start_telegram_bot_listener()
