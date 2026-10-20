@@ -80,6 +80,43 @@ automation_running = False
 automation_shape = None
 stop_event = threading.Event()
 
+active_config_cache = None
+active_config_lock = threading.Lock()
+loop_stop_reason = None
+
+
+def save_active_config(data):
+    global active_config_cache
+    if not data:
+        return
+    with active_config_lock:
+        active_config_cache = data.copy() if isinstance(data, dict) else data
+    for cfg_file in ('/app/active_config.json', 'active_config.json'):
+        try:
+            with open(cfg_file, 'w') as f:
+                json.dump(data, f, indent=2)
+        except Exception:
+            pass
+
+
+def get_saved_config():
+    global active_config_cache
+    with active_config_lock:
+        if active_config_cache and isinstance(active_config_cache, dict) and active_config_cache.get('user') and active_config_cache.get('private_key'):
+            return active_config_cache.copy()
+    for cfg_file in ('/app/active_config.json', 'active_config.json'):
+        if os.path.exists(cfg_file):
+            try:
+                with open(cfg_file) as f:
+                    data = json.load(f)
+                if data and isinstance(data, dict) and data.get('user') and data.get('private_key'):
+                    with active_config_lock:
+                        active_config_cache = data.copy()
+                    return data
+            except Exception:
+                pass
+    return None
+
 # Structured automation metrics tracker
 automation_stats = {
     "start_time": None,
@@ -167,7 +204,7 @@ def generate_daily_report_text(tz_name=None):
     with automation_lock:
         running = automation_running
 
-    state_badge = "🟢 <b>Actively Snatching (24/7)</b>" if running else "⏸️ <b>Idle / Stopped</b>"
+    state_badge = "🟢 <b>Actively Snatching (24/7)</b>" if running else "⏸️ <b>Idle / Paused</b>"
 
     uptime_str = "0m"
     if st.get("start_time"):
@@ -186,11 +223,14 @@ def generate_daily_report_text(tz_name=None):
         recent = list(global_logs)[-3:]
     logs_clean = "\n".join(f"• <code>{html.escape(l)}</code>" for l in recent) if recent else "<i>No recent logs</i>"
 
+    specs_str = st.get('specs_mode') or f"{st.get('ocpus', 4)} OCPUs | {st.get('memory_gb', 24)} GB RAM"
+    curr_spec_str = st.get('current_spec_label', '4 OCPU / 24 GB')
+
     report = (
         "📅 <b>Oracle A1 VM Snatcher — Daily Update</b>\n\n"
         f"• <b>Status:</b> {state_badge}\n"
         f"• <b>Target:</b> {html.escape(str(st.get('target_name', 'AlwaysFree-ARM')))}\n"
-        f"• <b>Specs:</b> {st.get('ocpus', 4)} OCPUs | {st.get('memory_gb', 24)} GB RAM | {st.get('boot_volume_gb', 50)} GB Boot\n"
+        f"• <b>Specs:</b> {html.escape(str(specs_str))} (Current: {html.escape(str(curr_spec_str))}) | {st.get('boot_volume_gb', 50)} GB Boot\n"
         f"• <b>Shape:</b> <code>{html.escape(str(st.get('shape', 'VM.Standard.A1.Flex')))}</code>\n"
         f"• <b>Region:</b> {html.escape(str(st.get('region', 'ap-singapore-1')))} ({html.escape(str(st.get('ad', 'AD-1'))[:30])})\n"
         f"• <b>Uptime:</b> {uptime_str}\n"
@@ -204,8 +244,10 @@ def generate_daily_report_text(tz_name=None):
         f"📋 <b>Recent Activity Snippet:</b>\n{logs_clean}\n\n"
         "💡 <i>The snatcher is actively querying Oracle for freed capacity. The instant a slot opens up, your VM will be claimed and you will receive an immediate alert with your public IP!</i>\n\n"
         "<b>Available Commands:</b>\n"
-        "• <code>/logs</code> - View latest 10 logs (or <code>/logs 20</code>)\n"
         "• <code>/status</code> - View current real-time status\n"
+        "• <code>/pause</code> - Pause snatcher provisioning loop\n"
+        "• <code>/resume</code> - Resume snatcher provisioning loop\n"
+        "• <code>/logs</code> - View latest 10 logs (or <code>/logs 20</code>)\n"
         "• <code>/daily</code> - Force send daily update report\n"
         "• <code>/livelog on</code> - Stream all attempts live to Telegram"
     )
@@ -220,7 +262,7 @@ def generate_status_text(tz_name=None):
     with automation_lock:
         running = automation_running
 
-    state_badge = "🟢 <b>Actively Snatching (24/7)</b>" if running else "⏸️ <b>Idle / Stopped</b>"
+    state_badge = "🟢 <b>Actively Snatching (24/7)</b>" if running else "⏸️ <b>Idle / Paused</b>"
 
     uptime_str = "0m"
     if st.get("start_time"):
@@ -234,16 +276,22 @@ def generate_status_text(tz_name=None):
         recent = list(global_logs)[-3:]
     logs_clean = "\n".join(f"• <code>{html.escape(l)}</code>" for l in recent) if recent else "<i>No logs yet</i>"
 
+    target_specs_str = st.get('specs_mode') or f"{st.get('ocpus', 4)} OCPU, {st.get('memory_gb', 24)} GB RAM"
+    current_attempt_str = f" (Attempting: {st.get('current_spec_label')})" if st.get('current_spec_label') else ""
+    action_tip = "Tap <b>⏸️ Pause</b> below or send <code>/pause</code> to pause." if running else "Tap <b>▶️ Resume</b> below or send <code>/resume</code> to resume."
+
     return (
         "🤖 <b>Oracle A1 VM Snatcher Status</b>\n\n"
         f"• <b>State:</b> {state_badge}\n"
         f"• <b>Target:</b> {html.escape(str(st.get('target_name', 'AlwaysFree-ARM')))}\n"
-        f"• <b>Shape:</b> <code>{html.escape(str(st.get('shape', 'VM.Standard.A1.Flex')))}</code> (4 OCPU, 24 GB RAM)\n"
+        f"• <b>Shape:</b> <code>{html.escape(str(st.get('shape', 'VM.Standard.A1.Flex')))}</code>\n"
+        f"• <b>Specs:</b> {html.escape(str(target_specs_str))}{html.escape(str(current_attempt_str))}\n"
         f"• <b>Region:</b> {html.escape(str(st.get('region', 'ap-singapore-1')))}\n"
         f"• <b>Attempts:</b> {st.get('total_attempts', 0):,} total ({st.get('attempts_today', 0):,} today)\n"
         f"• <b>Uptime:</b> {uptime_str}\n"
         f"• <b>Time:</b> {now_dt.strftime('%Y-%m-%d %H:%M:%S')}\n\n"
         f"<b>Latest Activity:</b>\n{logs_clean}\n\n"
+        f"💡 {action_tip}\n"
         "Send <code>/logs</code> for more logs, or <code>/daily</code> for daily statistics report."
     )
 
@@ -1019,12 +1067,17 @@ def resolve_telegram_chat(bot_token=None, explicit_chat_id=None):
     return None, None
 
 
-def get_main_keyboard():
+def get_main_keyboard(is_running=None):
+    if is_running is None:
+        with automation_lock:
+            is_running = automation_running
+    toggle_btn = {"text": "⏸️ Pause"} if is_running else {"text": "▶️ Resume"}
     return {
         "keyboard": [
-            [{"text": "📊 Status"}, {"text": "📋 Recent Logs"}],
-            [{"text": "📅 Daily Report"}, {"text": "📡 Live Logs ON"}],
-            [{"text": "🔕 Live Logs OFF"}, {"text": "🏓 Ping"}]
+            [toggle_btn, {"text": "📊 Status"}],
+            [{"text": "📋 Recent Logs"}, {"text": "📅 Daily Report"}],
+            [{"text": "📡 Live Logs ON"}, {"text": "🔕 Live Logs OFF"}],
+            [{"text": "🏓 Ping"}]
         ],
         "resize_keyboard": True,
         "is_persistent": False
@@ -1038,6 +1091,8 @@ def register_bot_commands(token=None):
     try:
         commands = [
             {"command": "status", "description": "📊 Real-time snatcher status & specs"},
+            {"command": "pause", "description": "⏸️ Pause snatcher provisioning loop"},
+            {"command": "resume", "description": "▶️ Resume snatcher provisioning loop"},
             {"command": "logs", "description": "📋 View latest 10 activity logs"},
             {"command": "daily", "description": "📅 Comprehensive 24h daily summary"},
             {"command": "livelog", "description": "📡 Stream live logs to chat (on/off)"},
@@ -1056,7 +1111,7 @@ def send_telegram_message(bot_token, chat_id, message, tz_name=None, reply_marku
         url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
         payload = {"chat_id": chat_id, "text": message, "parse_mode": "HTML"}
         if reply_markup is not False:
-            payload["reply_markup"] = reply_markup or get_main_keyboard()
+            payload["reply_markup"] = reply_markup if reply_markup is not None else get_main_keyboard()
         response = requests.post(url, json=payload, timeout=10)
         data = response.json()
         if data.get("ok"):
@@ -1067,7 +1122,7 @@ def send_telegram_message(bot_token, chat_id, message, tz_name=None, reply_marku
                 plain_text = re.sub(r'<[^>]+>', '', message)
                 fb_payload = {"chat_id": chat_id, "text": plain_text}
                 if reply_markup is not False:
-                    fb_payload["reply_markup"] = reply_markup or get_main_keyboard()
+                    fb_payload["reply_markup"] = reply_markup if reply_markup is not None else get_main_keyboard()
                 fb_resp = requests.post(url, json=fb_payload, timeout=10).json()
                 if fb_resp.get("ok"):
                     return True, "Message sent (plain text fallback)"
@@ -1110,8 +1165,9 @@ def get_oci_username(config, identity_client):
 
 
 def run_automated_creation(config, account_config, compute_client, network_client, identity_client,
-                           retry_delay=60, randomize_delay=False, random_min=25, random_max=60,
-                           telegram_bot_token=None, telegram_chat_id=None, tz_name=None):
+                           retry_delay=60, randomize_delay=True, random_min=60, random_max=90,
+                           telegram_bot_token=None, telegram_chat_id=None, tz_name=None,
+                           skip_start_alert=False):
     global automation_running
     set_user_tz(tz_name)
     oci_username = None
@@ -1172,19 +1228,46 @@ def run_automated_creation(config, account_config, compute_client, network_clien
             add_log("Boot volume raised to minimum 50 GB.")
             boot_gb = 50
         add_log(f"Setup Verified -> Subnet: {subnet_id[:20]}... | Image: {image_id[:20]}... | Zone: {ad_list[0] if ad_list else 'N/A'}")
-        add_log(f"Debug -> Shape: {account_config['shape']} | Boot: {boot_gb}GB | OCPUs: {account_config.get('ocpus', 'N/A')} | RAM: {account_config.get('memory', 'N/A')}GB")
-        add_log(f"Debug -> Subnet details: assign_public_ip=True")
         shape = account_config.get('shape', '')
         is_flex = '.Flex' in shape
-        add_log(f"Debug -> Shape='{shape}', is_flex={is_flex}")
+
+        # Enforce rate-limiting safeguards to prevent HTTP 429
+        if random_min < 50:
+            random_min = 60
+        if random_max < random_min + 15:
+            random_max = random_min + 30
+        if retry_delay < 50:
+            retry_delay = 60
+
+        # Specs rotation setup for ARM Flex (alternating between 4 OCPU / 24 GB and 2 OCPU / 12 GB)
+        try_both_specs = account_config.get('try_both_specs', True)
+        specs_rotation = account_config.get('specs_rotation')
+        if not specs_rotation and is_flex and try_both_specs:
+            specs_rotation = [
+                {"ocpus": 4, "memory": 24, "label": "4 OCPU / 24 GB"},
+                {"ocpus": 2, "memory": 12, "label": "2 OCPU / 12 GB"}
+            ]
+        elif not specs_rotation and is_flex:
+            ocpus_cfg = int(account_config.get('ocpus', 4))
+            memory_cfg = int(account_config.get('memory', 24))
+            specs_rotation = [
+                {"ocpus": ocpus_cfg, "memory": memory_cfg, "label": f"{ocpus_cfg} OCPU / {memory_cfg} GB"}
+            ]
+        elif not specs_rotation:
+            specs_rotation = []
+
+        add_log(f"Debug -> Shape: {shape} | Boot: {boot_gb}GB | is_flex={is_flex} | Specs Rotation: {[s['label'] for s in specs_rotation] if specs_rotation else 'None'}")
+        add_log(f"Debug -> Subnet details: assign_public_ip=True")
+
         shape_config = None
-        if is_flex:
+        if specs_rotation:
+            first_spec = specs_rotation[0]
+            shape_config = oci.core.models.LaunchInstanceShapeConfigDetails(ocpus=first_spec["ocpus"], memory_in_gbs=first_spec["memory"])
+        elif is_flex:
             ocpus = int(account_config.get('ocpus', 2))
             memory = int(account_config.get('memory', 12))
             shape_config = oci.core.models.LaunchInstanceShapeConfigDetails(ocpus=ocpus, memory_in_gbs=memory)
-            add_log(f"Debug -> Flex shape config: ocpus={ocpus}, memory={memory}")
-        else:
-            add_log(f"Debug -> Non-flex shape, no shape_config needed")
+
         instance_details = oci.core.models.LaunchInstanceDetails(
             compartment_id=config['tenancy'],
             availability_domain=ad_list[0] if ad_list else '',
@@ -1202,6 +1285,7 @@ def run_automated_creation(config, account_config, compute_client, network_clien
         add_log(f"Launching provisioning loop for '{target_name}'...")
         attempts = 0
         success = False
+        consecutive_429 = 0
         last_summary_time = time.time()
         start_time = time.time()
 
@@ -1210,26 +1294,43 @@ def run_automated_creation(config, account_config, compute_client, network_clien
             automation_stats["start_time"] = start_time
             automation_stats["target_name"] = target_name
             automation_stats["shape"] = account_config.get('shape', 'VM.Standard.A1.Flex')
-            automation_stats["ocpus"] = account_config.get('ocpus', 4)
-            automation_stats["memory_gb"] = account_config.get('memory', 24)
             automation_stats["boot_volume_gb"] = boot_gb
             automation_stats["region"] = target_region
             automation_stats["ad"] = ad_list[0] if ad_list else ''
             automation_stats["oci_username"] = oci_username
             automation_stats["last_status"] = "Starting launch attempts..."
+            if specs_rotation and len(specs_rotation) > 1:
+                automation_stats["specs_mode"] = "Dual Rotation (4 OCPU / 24 GB & 2 OCPU / 12 GB)"
+                automation_stats["current_spec_label"] = specs_rotation[0]["label"]
+                automation_stats["ocpus"] = specs_rotation[0]["ocpus"]
+                automation_stats["memory_gb"] = specs_rotation[0]["memory"]
+            elif specs_rotation:
+                automation_stats["specs_mode"] = specs_rotation[0]["label"]
+                automation_stats["current_spec_label"] = specs_rotation[0]["label"]
+                automation_stats["ocpus"] = specs_rotation[0]["ocpus"]
+                automation_stats["memory_gb"] = specs_rotation[0]["memory"]
+            else:
+                automation_stats["specs_mode"] = account_config.get('shape', 'VM.Standard.A1.Flex')
+                automation_stats["current_spec_label"] = account_config.get('shape', 'VM.Standard.A1.Flex')
+                automation_stats["ocpus"] = account_config.get('ocpus', 4)
+                automation_stats["memory_gb"] = account_config.get('memory', 24)
 
         # Send initial start alert to Telegram
-        init_chat = telegram_chat_id or get_active_chat_id()
-        if telegram_bot_token and init_chat:
-            start_msg = (
-                "🚀 <b>Oracle A1 VM Snatcher Started!</b>\n\n"
-                f"• <b>Target:</b> {target_name}\n"
-                f"• <b>Shape:</b> {account_config.get('shape', 'VM.Standard.A1.Flex')} ({account_config.get('ocpus', 4)} OCPU, {account_config.get('memory', 24)} GB RAM)\n"
-                f"• <b>Region:</b> {target_region}\n"
-                f"• <b>Time:</b> {format_user_time(tz_name=get_current_tz())}\n\n"
-                "<i>Monitoring capacity continuously 24/7. You will receive regular daily updates and an immediate alert the moment capacity is freed!</i>"
-            )
-            send_telegram_message(telegram_bot_token, init_chat, start_msg, get_current_tz())
+        if not skip_start_alert:
+            init_chat = telegram_chat_id or get_active_chat_id()
+            if telegram_bot_token and init_chat:
+                specs_desc = "Dual Rotation (4 OCPU / 24 GB & 2 OCPU / 12 GB)" if (specs_rotation and len(specs_rotation) > 1) else f"{account_config.get('ocpus', 4)} OCPU, {account_config.get('memory', 24)} GB RAM"
+                start_msg = (
+                    "🚀 <b>Oracle A1 VM Snatcher Started!</b>\n\n"
+                    f"• <b>Target:</b> {target_name}\n"
+                    f"• <b>Shape:</b> {account_config.get('shape', 'VM.Standard.A1.Flex')}\n"
+                    f"• <b>Specs:</b> {specs_desc}\n"
+                    f"• <b>Region:</b> {target_region}\n"
+                    f"• <b>Cadence:</b> 60–90s randomized (429 Rate-Limit Guard active)\n"
+                    f"• <b>Time:</b> {format_user_time(tz_name=get_current_tz())}\n\n"
+                    "<i>Monitoring capacity continuously 24/7. Immediate notification sent upon provisioning!</i>"
+                )
+                send_telegram_message(telegram_bot_token, init_chat, start_msg, get_current_tz(), reply_markup=get_main_keyboard(is_running=True))
         ad_index = 0
         import random as _random
         if len(ad_list) > 1:
@@ -1251,17 +1352,37 @@ def run_automated_creation(config, account_config, compute_client, network_clien
                 if 'current_ad' in locals() and current_ad:
                     automation_stats["ad"] = current_ad
 
+            # Determine spec for this attempt (alternating if dual mode)
+            current_spec = None
+            if specs_rotation:
+                current_spec = specs_rotation[(attempts - 1) % len(specs_rotation)]
+                instance_details.shape_config = oci.core.models.LaunchInstanceShapeConfigDetails(
+                    ocpus=current_spec["ocpus"],
+                    memory_in_gbs=current_spec["memory"]
+                )
+                spec_label = current_spec["label"]
+            else:
+                spec_label = f"{account_config.get('ocpus', 4)} OCPU / {account_config.get('memory', 24)} GB"
+
+            with stats_lock:
+                automation_stats["current_spec_label"] = spec_label
+                if current_spec:
+                    automation_stats["ocpus"] = current_spec["ocpus"]
+                    automation_stats["memory_gb"] = current_spec["memory"]
+
             # Send periodic status update every 6 hours or every 50 attempts
             if telegram_bot_token and current_chat and ((now - last_summary_time >= 21600) or (attempts > 1 and attempts % 50 == 0)):
                 last_summary_time = now
                 elapsed_min = int((now - start_time) / 60)
                 elapsed_hr = elapsed_min // 60
                 elapsed_rem_min = elapsed_min % 60
+                specs_desc = "Dual Rotation (4 OCPU / 24 GB & 2 OCPU / 12 GB)" if (specs_rotation and len(specs_rotation) > 1) else spec_label
                 summary_msg = (
                     "📊 <b>OCI Snatcher Status Update</b>\n\n"
                     "• <b>Status:</b> Actively Retrying\n"
                     f"• <b>Attempts:</b> {attempts}\n"
-                    f"• <b>Target Shape:</b> {account_config.get('shape', 'VM.Standard.A1.Flex')} ({account_config.get('ocpus', 4)} OCPU, {account_config.get('memory', 24)} GB RAM)\n"
+                    f"• <b>Target Specs:</b> {specs_desc}\n"
+                    f"• <b>Current Attempt:</b> {spec_label}\n"
                     f"• <b>Region:</b> {target_region} ({current_ad if 'current_ad' in locals() else 'AD-1'})\n"
                     f"• <b>Uptime:</b> {elapsed_hr}h {elapsed_rem_min}m\n"
                     f"• <b>Time:</b> {format_user_time(tz_name=get_current_tz())}\n\n"
@@ -1277,8 +1398,9 @@ def run_automated_creation(config, account_config, compute_client, network_clien
             instance_details.availability_domain = current_ad
             is_429 = False
             try:
-                add_log(f"Attempt {attempts}: sending instance launch request...")
+                add_log(f"Attempt {attempts} [{spec_label}]: sending instance launch request...")
                 response = compute_client.launch_instance(instance_details)
+                consecutive_429 = 0
                 instance_id = response.data.id
                 add_log(f"SUCCESS! Instance created: {instance_id[:20]}...")
                 add_log("Fetching instance public IP...")
@@ -1292,7 +1414,7 @@ def run_automated_creation(config, account_config, compute_client, network_clien
                     automation_stats["success"] = True
                     automation_stats["instance_id"] = instance_id
                     automation_stats["public_ip"] = public_ip
-                    automation_stats["last_status"] = "Successfully Provisioned!"
+                    automation_stats["last_status"] = f"Successfully Provisioned ({spec_label})!"
 
                 target_tg_chat = telegram_chat_id or get_active_chat_id()
                 if telegram_bot_token and target_tg_chat:
@@ -1305,13 +1427,13 @@ def run_automated_creation(config, account_config, compute_client, network_clien
                     tg_msg = (
                         f"&#9989; <b>OCI Provisioner Success!</b>\n\n"
                         f"<b>Instance:</b> {instance_name}\n"
-                        f"<b>Shape:</b> {shape}\n"
+                        f"<b>Shape:</b> {shape} ({spec_label})\n"
                         f"<b>Region:</b> {region}\n"
                         f"{ip_line}"
                         f"{user_line}"
                         f"<b>Time:</b> {user_time}\n"
                         f"<b>Status:</b> Running\n\n"
-                        f"Your Always Free instance has been successfully provisioned!"
+                        f"Your Always Free instance ({spec_label}) has been successfully provisioned!"
                     )
                     tg_ok, tg_err = send_telegram_message(telegram_bot_token, target_tg_chat, tg_msg, get_current_tz())
                     if tg_ok:
@@ -1326,17 +1448,19 @@ def run_automated_creation(config, account_config, compute_client, network_clien
                 add_log(f"Debug -> ServiceError code={code}, status={status}, msg={e.message[:120]}")
                 if "TooManyRequests" in msg or status == 429:
                     is_429 = True
+                    consecutive_429 += 1
                     with stats_lock:
                         automation_stats["rate_limit_count"] += 1
                         automation_stats["last_status"] = "Too Many Requests (429 Rate Limited)"
                     user_info = f" [user: {oci_username}]" if oci_username else ""
-                    add_log(f"Rate limited (429) in '{target_region}'.{user_info} Backing off...")
+                    add_log(f"Rate limited (429) in '{target_region}'.{user_info} (streak: {consecutive_429}) Backing off...")
                 elif "Out of capacity" in msg or status in (500, 503, 504):
+                    consecutive_429 = 0
                     with stats_lock:
                         automation_stats["capacity_busy_count"] += 1
-                        automation_stats["last_status"] = "Out of host capacity (500)"
+                        automation_stats["last_status"] = f"Out of host capacity (500) for {spec_label}"
                     user_info = f" [user: {oci_username}]" if oci_username else ""
-                    add_log(f"Capacity busy in '{target_region}' AD '{current_ad}'.{user_info} Retrying...")
+                    add_log(f"Capacity busy in '{target_region}' AD '{current_ad}' for [{spec_label}].{user_info} Retrying...")
                     if len(ad_list) > 1:
                         ad_index += 1
                         next_ad = ad_list[ad_index % len(ad_list)]
@@ -1366,9 +1490,11 @@ def run_automated_creation(config, account_config, compute_client, network_clien
                         continue
                     break
             except (ConnectionError, OSError) as e:
+                consecutive_429 = 0
                 user_info = f" [user: {oci_username}]" if oci_username else ""
                 add_log(f"Connection issue in '{target_region}': {type(e).__name__}.{user_info} Retrying...")
             except Exception as e:
+                consecutive_429 = 0
                 msg = str(e)
                 if "Remote end closed connection" in msg or "Connection aborted" in msg or "timeout" in msg.lower():
                     user_info = f" [user: {oci_username}]" if oci_username else ""
@@ -1380,27 +1506,42 @@ def run_automated_creation(config, account_config, compute_client, network_clien
             if randomize_delay:
                 actual_delay = random.randint(random_min, random_max)
             if is_429:
-                actual_delay = max(actual_delay, 50)
-                add_log(f"Rate limit backoff: extending wait to {actual_delay}s")
+                backoff_base = 120 + min((consecutive_429 - 1) * 30, 180)
+                actual_delay = random.randint(backoff_base, backoff_base + 45)
+                add_log(f"Rate limit guard: backing off for {actual_delay}s to allow API token bucket to reset...")
             else:
                 add_log(f"Dynamic retry: waiting {actual_delay}s (randomized {random_min}-{random_max}s)")
             if stop_event.wait(actual_delay):
                 add_log("Provisioning loop stopped while waiting.")
                 break
         if not success:
-            add_log("Provisioning loop ended without success.")
+            was_stopped = stop_event.is_set()
+            global loop_stop_reason
+            stopped_by_telegram = was_stopped and (loop_stop_reason == "telegram")
+            add_log("Provisioning loop stopped by user." if was_stopped else "Provisioning loop ended without success.")
             target_tg_chat = telegram_chat_id or get_active_chat_id()
-            if telegram_bot_token and target_tg_chat:
+            if telegram_bot_token and target_tg_chat and not stopped_by_telegram:
                 user_line = f"<b>User:</b> {oci_username}\n" if oci_username else ""
                 user_time = format_user_time(tz_name=get_current_tz())
-                tg_msg = (
-                    f"&#10060; <b>OCI Provisioner Stopped</b>\n\n"
-                    f"{user_line}"
-                    f"Loop stopped after {attempts} attempts without success.\n"
-                    f"<b>Region:</b> {config.get('region', 'unknown')}\n"
-                    f"<b>Time:</b> {user_time}"
-                )
-                send_telegram_message(telegram_bot_token, target_tg_chat, tg_msg, get_current_tz())
+                if was_stopped:
+                    tg_msg = (
+                        f"⏸️ <b>OCI Provisioner Paused</b>\n\n"
+                        f"{user_line}"
+                        f"Provisioning loop paused via Web Dashboard after {attempts} attempts.\n"
+                        f"<b>Region:</b> {config.get('region', 'unknown')}\n"
+                        f"<b>Time:</b> {user_time}\n\n"
+                        "Tap <b>▶️ Resume</b> below or send <code>/resume</code> anytime to continue."
+                    )
+                else:
+                    tg_msg = (
+                        f"&#10060; <b>OCI Provisioner Stopped</b>\n\n"
+                        f"{user_line}"
+                        f"Loop stopped after {attempts} attempts without success.\n"
+                        f"<b>Region:</b> {config.get('region', 'unknown')}\n"
+                        f"<b>Time:</b> {user_time}\n\n"
+                        "Tap <b>▶️ Resume</b> below or send <code>/resume</code> to restart."
+                    )
+                send_telegram_message(telegram_bot_token, target_tg_chat, tg_msg, get_current_tz(), reply_markup=get_main_keyboard(is_running=False))
     except Exception as e:
         msg = str(e)
         if "Remote end closed connection" in msg or "Connection aborted" in msg:
@@ -1455,80 +1596,108 @@ def get_status():
         })
 
 
-@app.route('/api/auto-launch-loop', methods=['POST'])
-@require_auth
-def auto_launch():
-    global automation_running, tg_live_enabled, tg_live_bot_token, tg_live_chat_id
-    data = request.json or {}
-    set_user_tz(data.get('timezone'))
+def start_snatcher_loop(data, source="api"):
+    global automation_running, automation_shape, tg_live_enabled, tg_live_bot_token, tg_live_chat_id, loop_stop_reason
+    if not data or not data.get('user') or not data.get('private_key'):
+        return False, "No valid configuration found. Please configure the snatcher from the web UI first."
+
     config = build_config(data)
     try:
         oci.config.validate_config(config)
     except Exception as e:
-        return jsonify({'success': False, 'error': f"Invalid OCI config: {e}"})
-    requested_shape = data.get('shape', '')
-    bot_token = data.get('telegram_bot_token', '').strip() or DEFAULT_BOT_TOKEN
-    chat_id = data.get('telegram_chat_id', '').strip() or DEFAULT_CHAT_ID
-    if bot_token and (not chat_id or chat_id.lower() == 'auto'):
+        return False, f"Invalid OCI config: {e}"
+
+    requested_shape = data.get('shape', 'VM.Standard.A1.Flex')
+    bot_token = (data.get('telegram_bot_token') or '').strip() or DEFAULT_BOT_TOKEN
+    chat_id = (data.get('telegram_chat_id') or '').strip() or DEFAULT_CHAT_ID
+
+    if bot_token and (not chat_id or str(chat_id).lower() == 'auto'):
         detected_id, _ = resolve_telegram_chat(bot_token)
         if detected_id:
             chat_id = detected_id
+            set_active_chat_id(chat_id)
+    elif chat_id:
+        set_active_chat_id(chat_id)
+
     enable_live = data.get('telegram_live_log', False)
     with tg_live_lock:
         tg_live_enabled = bool(enable_live and bot_token and chat_id)
         tg_live_bot_token = bot_token if enable_live else None
         tg_live_chat_id = chat_id if enable_live else None
         tg_live_last_sent = 0
+
     with automation_lock:
         if automation_running:
             if automation_shape and automation_shape != requested_shape:
-                return jsonify({'success': False, 'error': f"A provisioning loop is already running for shape '{automation_shape}'. Stop it first before starting '{requested_shape}'."})
-            return jsonify({'success': False, 'error': 'A provisioning loop is already running.'})
+                return False, f"A provisioning loop is already running for shape '{automation_shape}'. Stop it first before starting '{requested_shape}'."
+            return False, "A provisioning loop is already running."
         automation_running = True
         automation_shape = requested_shape
         stop_event.clear()
+        loop_stop_reason = None
+
     try:
         compute_client = oci.core.ComputeClient(config)
         network_client = oci.core.VirtualNetworkClient(config)
         identity_client = oci.identity.IdentityClient(config)
         retry_delay = int(data.get('retry_delay', 60))
-        if retry_delay < 10:
-            retry_delay = 10
-        randomize_delay = data.get('randomize_delay', False)
-        random_min = int(data.get('random_min', 25))
-        random_max = int(data.get('random_max', 60))
+        if retry_delay < 50:
+            retry_delay = 60
+        randomize_delay = data.get('randomize_delay', True)
+        random_min = max(int(data.get('random_min', 60)), 50)
+        random_max = max(int(data.get('random_max', 90)), random_min + 15)
+        tz = data.get('timezone', 'Asia/Jakarta')
+        set_user_tz(tz)
+
+        skip_start_alert = (source == "telegram")
+
         thread = threading.Thread(
             target=run_automated_creation,
             args=(config, data, compute_client, network_client, identity_client,
                   retry_delay, randomize_delay, random_min, random_max,
-                  bot_token, chat_id,
-                  get_current_tz()),
+                  bot_token, chat_id, tz, skip_start_alert),
             daemon=True
         )
         thread.start()
-        # Persist active configuration to disk for automatic restart recovery
-        for cfg_file in ('/app/active_config.json', 'active_config.json'):
-            try:
-                with open(cfg_file, 'w') as f:
-                    json.dump(data, f)
-            except Exception:
-                pass
-        return jsonify({'success': True, 'message': 'Provisioning loop started.' + (' Live Telegram logging enabled.' if tg_live_enabled else '')})
+
+        save_active_config(data)
+
+        return True, "Provisioning loop started." + (" Live Telegram logging enabled." if tg_live_enabled else "")
     except Exception as e:
         with automation_lock:
             automation_running = False
             automation_shape = None
-        return jsonify({'success': False, 'error': str(e)})
+        return False, str(e)
+
+
+def stop_snatcher_loop(source="web"):
+    global tg_live_enabled, loop_stop_reason
+    with automation_lock:
+        if not automation_running:
+            return False, "Provisioning loop is not currently running."
+        loop_stop_reason = source
+    stop_event.set()
+    with tg_live_lock:
+        tg_live_enabled = False
+    return True, "Stop signal sent."
+
+
+@app.route('/api/auto-launch-loop', methods=['POST'])
+@require_auth
+def auto_launch():
+    data = request.json or {}
+    set_user_tz(data.get('timezone'))
+    ok, msg = start_snatcher_loop(data, source="api")
+    if not ok:
+        return jsonify({'success': False, 'error': msg})
+    return jsonify({'success': True, 'message': msg})
 
 
 @app.route('/api/stop-loop', methods=['POST'])
 @require_auth
 def stop_loop():
-    global tg_live_enabled
-    stop_event.set()
-    with tg_live_lock:
-        tg_live_enabled = False
-    return jsonify({'success': True, 'message': 'Stop signal sent.'})
+    ok, msg = stop_snatcher_loop(source="web")
+    return jsonify({'success': True, 'message': msg})
 
 
 @app.route('/api/logs', methods=['GET'])
@@ -1718,46 +1887,122 @@ if __name__ == '__main__':
 
 # ---- Auto-Resume Saved Configuration on Container Start ----
 def auto_resume_saved_config():
-    for cfg_file in ('/app/active_config.json', 'active_config.json'):
-        if os.path.exists(cfg_file):
-            try:
-                with open(cfg_file) as f:
-                    data = json.load(f)
-                if data and data.get('user') and data.get('private_key'):
-                    add_log(f"Auto-resuming saved snatcher configuration from {cfg_file}...")
-                    config = build_config(data)
-                    oci.config.validate_config(config)
-                    requested_shape = data.get('shape', 'VM.Standard.A1.Flex')
-                    bot_token = data.get('telegram_bot_token', '').strip() or DEFAULT_BOT_TOKEN
-                    chat_id = data.get('telegram_chat_id', '').strip() or DEFAULT_CHAT_ID
-                    if chat_id:
-                        set_active_chat_id(chat_id)
-                    with automation_lock:
-                        global automation_running, automation_shape
-                        if automation_running:
-                            return
-                        automation_running = True
-                        automation_shape = requested_shape
-                        stop_event.clear()
-                    compute_client = oci.core.ComputeClient(config)
-                    network_client = oci.core.VirtualNetworkClient(config)
-                    identity_client = oci.identity.IdentityClient(config)
-                    retry_delay = int(data.get('retry_delay', 60))
-                    randomize_delay = data.get('randomize_delay', True)
-                    random_min = int(data.get('random_min', 25))
-                    random_max = int(data.get('random_max', 60))
-                    tz = data.get('timezone', 'Asia/Jakarta')
-                    threading.Thread(
-                        target=run_automated_creation,
-                        args=(config, data, compute_client, network_client, identity_client,
-                              retry_delay, randomize_delay, random_min, random_max,
-                              bot_token, chat_id, tz),
-                        daemon=True
-                    ).start()
-                    add_log("Snatcher provisioning loop auto-resumed successfully.")
+    cfg = get_saved_config()
+    if cfg:
+        add_log("Auto-resuming saved snatcher configuration...")
+        ok, msg = start_snatcher_loop(cfg, source="auto_resume")
+        if ok:
+            add_log("Snatcher provisioning loop auto-resumed successfully.")
+        else:
+            add_log(f"Auto-resume notice: {msg}")
+
+
+# ---- Telegram Bot Action Handlers ----
+def handle_telegram_pause(token, chat_id):
+    with automation_lock:
+        is_running = automation_running
+    if not is_running:
+        reply = (
+            "⏸️ <b>Snatcher Is Already Paused</b>\n\n"
+            "The provisioning loop is not currently active.\n\n"
+            "Tap <b>▶️ Resume</b> below or send <code>/resume</code> anytime to start snatching."
+        )
+        send_telegram_message(token, chat_id, reply, reply_markup=get_main_keyboard(is_running=False))
+        return
+
+    stop_snatcher_loop(source="telegram")
+    with stats_lock:
+        st = automation_stats.copy()
+    tz = get_user_tz(get_current_tz())
+    now_dt = datetime.datetime.now(tz)
+    target = st.get('target_name', 'AlwaysFree-ARM')
+    shape = st.get('shape', 'VM.Standard.A1.Flex')
+    attempts_total = st.get('total_attempts', 0)
+    last_st = st.get('last_status', 'Paused by user')
+    region = st.get('region', 'ap-singapore-1')
+    reply = (
+        "⏸️ <b>Oracle A1 VM Snatcher Paused</b>\n\n"
+        "The provisioning loop has been paused. No further launch requests will be sent to Oracle Cloud.\n\n"
+        f"• <b>Target:</b> {html.escape(str(target))}\n"
+        f"• <b>Shape:</b> <code>{html.escape(str(shape))}</code>\n"
+        f"• <b>Total Attempts:</b> {attempts_total:,} requests\n"
+        f"• <b>Last Status:</b> {html.escape(str(last_st))}\n"
+        f"• <b>Region:</b> {html.escape(str(region))}\n"
+        f"• <b>Time:</b> {now_dt.strftime('%Y-%m-%d %H:%M:%S')}\n\n"
+        "Tap <b>▶️ Resume</b> below or send <code>/resume</code> anytime to continue snatching."
+    )
+    send_telegram_message(token, chat_id, reply, reply_markup=get_main_keyboard(is_running=False))
+
+
+def handle_telegram_resume(token, chat_id):
+    if stop_event.is_set():
+        for _ in range(30):
+            with automation_lock:
+                if not automation_running:
                     break
-            except Exception as e:
-                add_log(f"Auto-resume notice: {e}")
+            time.sleep(0.1)
+
+    with automation_lock:
+        is_running = automation_running
+    if is_running:
+        reply = (
+            "🟢 <b>Snatcher Is Already Running</b>\n\n"
+            "The provisioning loop is actively monitoring and querying Oracle Cloud for freed capacity 24/7.\n\n"
+            "• Send <code>/status</code> to check real-time progress\n"
+            "• Tap <b>⏸️ Pause</b> below to pause the snatcher"
+        )
+        send_telegram_message(token, chat_id, reply, reply_markup=get_main_keyboard(is_running=True))
+        return
+
+    saved_cfg = get_saved_config()
+    if not saved_cfg:
+        reply = (
+            "⚠️ <b>No Active Configuration Found</b>\n\n"
+            "Unable to resume: no saved OCI credentials or settings were found.\n\n"
+            "Please open the Web Dashboard, configure your tenancy details, and start the loop at least once so your settings are saved."
+        )
+        send_telegram_message(token, chat_id, reply, reply_markup=get_main_keyboard(is_running=False))
+        return
+
+    # Update telegram chat ID and token in saved config to this active chat
+    saved_cfg['telegram_chat_id'] = chat_id
+    if token:
+        saved_cfg['telegram_bot_token'] = token
+
+    ok, err_or_msg = start_snatcher_loop(saved_cfg, source="telegram")
+    if not ok:
+        reply = (
+            "⚠️ <b>Failed to Resume Snatcher</b>\n\n"
+            f"<b>Error:</b> <code>{html.escape(str(err_or_msg))}</code>\n\n"
+            "Please check your credentials in the Web Dashboard."
+        )
+        send_telegram_message(token, chat_id, reply, reply_markup=get_main_keyboard(is_running=False))
+        return
+
+    tz = get_user_tz(saved_cfg.get('timezone'))
+    now_dt = datetime.datetime.now(tz)
+    target = saved_cfg.get('display_name', 'AlwaysFree-ARM')
+    shape = saved_cfg.get('shape', 'VM.Standard.A1.Flex')
+    specs_rot = saved_cfg.get('specs_rotation')
+    if specs_rot and len(specs_rot) > 1:
+        specs_desc = "Dual Rotation (4 OCPU / 24 GB & 2 OCPU / 12 GB)"
+    elif specs_rot:
+        specs_desc = specs_rot[0].get('label', '4 OCPU / 24 GB')
+    else:
+        specs_desc = f"{saved_cfg.get('ocpus', 4)} OCPU / {saved_cfg.get('memory', 24)} GB RAM"
+    region = saved_cfg.get('region', 'ap-singapore-1')
+    reply = (
+        "▶️ <b>Oracle A1 VM Snatcher Resumed!</b>\n\n"
+        "The provisioning loop has been resumed successfully.\n\n"
+        f"• <b>Target:</b> {html.escape(str(target))}\n"
+        f"• <b>Shape:</b> <code>{html.escape(str(shape))}</code>\n"
+        f"• <b>Specs:</b> {html.escape(str(specs_desc))}\n"
+        f"• <b>Region:</b> {html.escape(str(region))}\n"
+        "• <b>Cadence:</b> 60–90s randomized (429 Rate-Limit Guard active)\n"
+        f"• <b>Time:</b> {now_dt.strftime('%Y-%m-%d %H:%M:%S')}\n\n"
+        "<i>Monitoring capacity continuously 24/7. Immediate notification sent upon provisioning!</i>"
+    )
+    send_telegram_message(token, chat_id, reply, reply_markup=get_main_keyboard(is_running=True))
 
 
 # ---- Dedicated Periodic Updater (Daily Updates & Heartbeats) ----
@@ -1839,7 +2084,7 @@ def start_telegram_bot_listener():
                     time.sleep(10)
                     continue
                 url = f"https://api.telegram.org/bot{token}/getUpdates"
-                params = {"timeout": 25, "allowed_updates": ["message"]}
+                params = {"timeout": 25, "allowed_updates": ["message", "callback_query"]}
                 if last_offset:
                     params["offset"] = last_offset
                 
@@ -1856,6 +2101,33 @@ def start_telegram_bot_listener():
                         update_id = update["update_id"]
                         if update_id >= last_offset:
                             last_offset = update_id + 1
+
+                        # Handle Inline Keyboard callbacks
+                        cb = update.get("callback_query")
+                        if cb:
+                            cb_id = cb.get("id")
+                            cb_data = (cb.get("data") or "").strip().lower()
+                            cb_msg = cb.get("message", {})
+                            chat = cb_msg.get("chat", {})
+                            chat_id = str(chat.get("id"))
+                            set_active_chat_id(chat_id)
+                            try:
+                                requests.post(f"https://api.telegram.org/bot{token}/answerCallbackQuery",
+                                              json={"callback_query_id": cb_id}, timeout=5)
+                            except Exception:
+                                pass
+                            if cb_data in ("pause", "tg_pause"):
+                                handle_telegram_pause(token, chat_id)
+                            elif cb_data in ("resume", "tg_resume"):
+                                handle_telegram_resume(token, chat_id)
+                            elif cb_data in ("status", "tg_status"):
+                                send_telegram_message(token, chat_id, generate_status_text())
+                            elif cb_data in ("logs", "tg_logs"):
+                                send_telegram_message(token, chat_id, generate_logs_text())
+                            elif cb_data in ("daily", "tg_daily"):
+                                send_telegram_message(token, chat_id, generate_daily_report_text())
+                            continue
+
                         msg = update.get("message")
                         if not msg:
                             continue
@@ -1874,10 +2146,51 @@ def start_telegram_bot_listener():
                         is_logs = ("log" in text_lower) and not is_live_on and not is_live_off
                         is_status = "status" in text_lower or "stat" in text_lower or "state" in text_lower or "check" in text_lower or "how" in text_lower
                         is_ping = "ping" in text_lower
-                        is_help = "help" in text_lower or "start" in text_lower or "menu" in text_lower
 
-                        # 1. Live Log Toggle Commands
-                        if is_live_on:
+                        # Pause / Resume matching
+                        is_pause = (
+                            not is_live_off and (
+                                "pause" in text_lower or
+                                text_lower.startswith("/pause") or
+                                text_lower == "stop" or
+                                text_lower.startswith("/stop") or
+                                "⏸️" in text or
+                                text_lower == "stop snatcher"
+                            )
+                        )
+                        is_resume = (
+                            "resume" in text_lower or
+                            text_lower.startswith("/resume") or
+                            "unpause" in text_lower or
+                            "▶️" in text or
+                            text_lower == "resume snatcher" or
+                            text_lower == "start snatcher"
+                        )
+
+                        if "pause/resume" in text_lower or "pause / resume" in text_lower or text_lower == "toggle":
+                            with automation_lock:
+                                is_running = automation_running
+                            if is_running:
+                                is_pause = True
+                                is_resume = False
+                            else:
+                                is_resume = True
+                                is_pause = False
+
+                        is_help = not is_pause and not is_resume and (
+                            "help" in text_lower or text_lower.startswith("/start") or text_lower == "start" or "menu" in text_lower
+                        )
+
+                        # 1. Pause Snatcher
+                        if is_pause:
+                            handle_telegram_pause(token, chat_id)
+
+                        # 2. Resume Snatcher
+                        elif is_resume:
+                            handle_telegram_resume(token, chat_id)
+
+                        # 3. Live Log Toggle Commands
+                        elif is_live_on:
                             global tg_live_enabled, tg_live_bot_token, tg_live_chat_id
                             with tg_live_lock:
                                 tg_live_enabled = True
@@ -1900,12 +2213,12 @@ def start_telegram_bot_listener():
                             )
                             send_telegram_message(token, chat_id, reply)
 
-                        # 2. Daily Report / Summary
+                        # 4. Daily Report / Summary
                         elif is_daily:
                             reply = generate_daily_report_text()
                             send_telegram_message(token, chat_id, reply)
 
-                        # 3. Recent Logs
+                        # 5. Recent Logs
                         elif is_logs:
                             num = 10
                             parts = text.split()
@@ -1914,23 +2227,24 @@ def start_telegram_bot_listener():
                             reply = generate_logs_text(num_lines=num)
                             send_telegram_message(token, chat_id, reply)
 
-                        # 4. Status Check
+                        # 6. Status Check
                         elif is_status:
                             reply = generate_status_text()
                             send_telegram_message(token, chat_id, reply)
 
-                        # 5. Ping
+                        # 7. Ping
                         elif is_ping:
                             send_telegram_message(token, chat_id, "🏓 <b>Pong!</b> Snatcher service is active, responsive, and monitoring 24/7.")
 
-                        # 6. Start / Help / Menu
+                        # 8. Start / Help / Menu
                         elif is_help:
                             reply = (
                                 f"👋 <b>Hello {user_name}!</b>\n\n"
                                 "Welcome to <b>Oracle A1 VM Snatcher</b> bot.\n"
-                                "Your Always Free Ampere A1 (4 OCPU, 24 GB RAM) snatcher is actively monitored.\n\n"
+                                "Your Always Free Ampere A1 snatcher is actively alternating between <b>4 OCPU / 24 GB</b> and <b>2 OCPU / 12 GB</b> with 429 rate-limit protection.\n\n"
                                 "<b>🔘 Quick Menu Options:</b>\n"
-                                "Use the persistent keyboard buttons below for 1-tap commands:\n\n"
+                                "Use the menu buttons below for 1-tap commands:\n\n"
+                                "• <b>⏸️ Pause / ▶️ Resume</b> - Pause or resume the snatcher loop\n"
                                 "• <b>📊 Status</b> - Real-time snatcher state & specs\n"
                                 "• <b>📋 Recent Logs</b> - View latest 10 attempt logs\n"
                                 "• <b>📅 Daily Report</b> - Comprehensive 24h summary report\n"
@@ -1942,18 +2256,18 @@ def start_telegram_bot_listener():
                             )
                             send_telegram_message(token, chat_id, reply)
 
-                        # 7. Fallback for ANY other message
+                        # 9. Fallback for ANY other message
                         else:
                             with automation_lock:
                                 is_running = automation_running
-                            status_badge = "🟢 <b>Actively Snatching (24/7)</b>" if is_running else "⏸️ <b>Idle / Stopped</b>"
+                            status_badge = "🟢 <b>Actively Snatching (24/7)</b>" if is_running else "⏸️ <b>Idle / Paused</b>"
                             with logs_lock:
                                 recent = list(global_logs)[-3:]
                             logs_clean = "\n".join(f"• <code>{html.escape(l)}</code>" for l in recent) if recent else "<i>No logs yet</i>"
                             reply = (
                                 f"🤖 <b>Oracle A1 VM Snatcher:</b> {status_badge}\n\n"
                                 f"<b>Latest Activity:</b>\n{logs_clean}\n\n"
-                                "Tap any button on the menu below to check status or logs:"
+                                "Tap any button on the menu below to control or check status:"
                             )
                             send_telegram_message(token, chat_id, reply)
             except Exception as e:

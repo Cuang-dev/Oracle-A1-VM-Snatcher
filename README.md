@@ -87,6 +87,22 @@ The snatcher sends notifications directly to your Telegram chat.
    > 🚀 **Oracle A1 VM Snatcher Connected!**  
    > Notifications for instance provisioning will be sent here.
 
+### Interactive Bot Controls & Commands:
+The Telegram bot ([@cuanglabbot](https://t.me/cuanglabbot)) includes an interactive keyboard and slash commands to control the snatcher remotely:
+
+| Button / Command | Description |
+|---|---|
+| `⏸️ Pause` / `/pause` | Pauses the snatcher loop immediately without losing saved configurations |
+| `▶️ Resume` / `/resume` | Resumes the snatcher loop using active/saved OCI credentials |
+| `📊 Status` / `/status` | View real-time snatcher state, current attempt specs, attempts count, and uptime |
+| `📋 Recent Logs` / `/logs` | View recent activity logs (`/logs 20` for up to 30 lines) |
+| `📅 Daily Report` / `/daily` | Force-send a comprehensive 24h progress summary |
+| `📡 Live Logs ON` / `/livelog on` | Stream every attempt result in real-time to Telegram |
+| `🔕 Live Logs OFF` / `/livelog off` | Pause live attempt streaming |
+| `🏓 Ping` / `/ping` | Test bot responsiveness |
+
+> 💡 **Dynamic Pause/Resume Button**: The bot's reply keyboard dynamically switches between **⏸️ Pause** (when running) and **▶️ Resume** (when paused or idle) so you can toggle provisioning with a single tap.
+
 When an instance is caught, you'll receive:
 ```
 ✅ OCI Provisioner Success!
