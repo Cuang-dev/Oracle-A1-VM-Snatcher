@@ -8,9 +8,13 @@ import functools
 import requests
 import html
 import json
+import asyncio
+import resource
 from flask import Flask, render_template, request, jsonify, Response
 from collections import deque
 import oci
+import discord
+from discord.ext import tasks
 
 # ---- Timezone Configuration (User device timezone) ----
 from zoneinfo import ZoneInfo, available_timezones
@@ -70,6 +74,54 @@ def get_active_chat_id():
     with tg_chat_lock:
         return active_telegram_chat_id or DEFAULT_CHAT_ID
 
+# ---- Discord Bot Config & State ----
+DEFAULT_DISCORD_BOT_TOKEN = os.environ.get('DISCORD_BOT_TOKEN', 'YOUR_DISCORD_BOT_TOKEN_HERE')
+DEFAULT_DISCORD_CHANNEL_ID = int(os.environ.get('DISCORD_CHANNEL_ID', '1562121709044244550'))
+DEFAULT_DISCORD_GUILD_ID = int(os.environ.get('DISCORD_GUILD_ID', '1555473890640134237'))
+
+def get_discord_bot_token():
+    cfg = get_saved_config()
+    if cfg and cfg.get('discord_bot_token'):
+        return str(cfg['discord_bot_token']).strip()
+    return os.environ.get('DISCORD_BOT_TOKEN', DEFAULT_DISCORD_BOT_TOKEN).strip()
+
+def get_discord_channel_id():
+    cfg = get_saved_config()
+    if cfg and cfg.get('discord_channel_id'):
+        try:
+            return int(cfg['discord_channel_id'])
+        except Exception:
+            pass
+    try:
+        return int(os.environ.get('DISCORD_CHANNEL_ID', DEFAULT_DISCORD_CHANNEL_ID))
+    except Exception:
+        return DEFAULT_DISCORD_CHANNEL_ID
+
+def get_mem_usage_mb():
+    try:
+        return round(resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024, 1)
+    except Exception:
+        return 0
+
+discord_client = None
+discord_loop = None
+
+def trigger_discord_dashboard_update():
+    global discord_client, discord_loop
+    if discord_client and discord_loop and discord_loop.is_running():
+        try:
+            asyncio.run_coroutine_threadsafe(discord_client.update_dashboard_now(), discord_loop)
+        except Exception:
+            pass
+
+def notify_discord_success(account_config, spec_label, target_region, public_ip, instance_id, oci_username):
+    global discord_client, discord_loop
+    if discord_client and discord_loop and discord_loop.is_running():
+        try:
+            coro = discord_client.send_success_alert(account_config, spec_label, target_region, public_ip, instance_id, oci_username)
+            asyncio.run_coroutine_threadsafe(coro, discord_loop)
+        except Exception as e:
+            add_log(f"[Discord] Could not dispatch success alert: {e}")
 
 # ---- Shared state ----
 global_logs = deque(maxlen=1000)
@@ -77,6 +129,7 @@ logs_lock = threading.Lock()
 
 automation_lock = threading.Lock()
 automation_running = False
+automation_desired = True  # Persistent 24/7 desired run state
 automation_shape = None
 stop_event = threading.Event()
 
@@ -1181,33 +1234,44 @@ def run_automated_creation(config, account_config, compute_client, network_clien
         add_log(f"Could not detect OCI username: {str(e)}")
     try:
         block_client = oci.core.BlockstorageClient(config)
-        ok, err = check_free_tier_limits(config, account_config, compute_client, block_client, identity_client)
-        if not ok:
-            add_log(f"Free tier limit check failed: {err}")
-            return
+        try:
+            ok, err = check_free_tier_limits(config, account_config, compute_client, block_client, identity_client)
+            if not ok:
+                add_log(f"Free tier limit check notice: {err} (proceeding in continuous 24/7 loop)")
+        except Exception as e:
+            add_log(f"Limit pre-check notice: {e} (proceeding in continuous 24/7 loop)")
+
         add_log(f"Initializing infrastructure scan inside: {target_region}...")
-        ads = identity_client.list_availability_domains(compartment_id=config['tenancy']).data
-        ad_list = [ad.name for ad in ads] if ads else []
-        add_log(f"Availability domains found: {len(ad_list)} — {', '.join(ad_list)}")
+        ad_list = []
+        try:
+            ads = identity_client.list_availability_domains(compartment_id=config['tenancy']).data
+            ad_list = [ad.name for ad in ads] if ads else []
+            add_log(f"Availability domains found: {len(ad_list)} — {', '.join(ad_list)}")
+        except Exception as e:
+            add_log(f"Availability domain discovery notice: {e}")
+
         ad_preference = account_config.get('ad_preference', '')
         if ad_preference and ad_preference in ad_list:
             ad_list.remove(ad_preference)
             ad_list.insert(0, ad_preference)
             add_log(f"Using preferred AD: {ad_preference}")
         elif ad_preference:
-            add_log(f"Preferred AD '{ad_preference}' not found, using auto-rotation")
+            ad_list = [ad_preference]
+            add_log(f"Using configured preferred AD: {ad_preference}")
+        elif not ad_list:
+            ad_list = ['EHjf:AP-SINGAPORE-1-AD-1']
+
         subnet_id = account_config.get('subnet_id')
         if not subnet_id:
-            vcns = network_client.list_vcns(compartment_id=config['tenancy']).data
-            if not vcns:
-                add_log("Error: No VCN found.")
-                return
-            subnets = network_client.list_subnets(compartment_id=config['tenancy'], vcn_id=vcns[0].id).data
-            if not subnets:
-                add_log("Error: No subnet found.")
-                return
-            subnet_id = subnets[0].id
-            add_log("Auto-selected subnet: " + subnet_id[:20] + "...")
+            try:
+                vcns = network_client.list_vcns(compartment_id=config['tenancy']).data
+                if vcns:
+                    subnets = network_client.list_subnets(compartment_id=config['tenancy'], vcn_id=vcns[0].id).data
+                    if subnets:
+                        subnet_id = subnets[0].id
+                        add_log("Auto-selected subnet: " + subnet_id[:20] + "...")
+            except Exception as e:
+                add_log(f"Subnet auto-discovery notice: {e}")
         else:
             add_log("Using selected subnet: " + subnet_id[:20] + "...")
         image_id = account_config.get('image_id')
@@ -1416,6 +1480,9 @@ def run_automated_creation(config, account_config, compute_client, network_clien
                     automation_stats["public_ip"] = public_ip
                     automation_stats["last_status"] = f"Successfully Provisioned ({spec_label})!"
 
+                # Trigger Discord alert in #oracle-vm
+                notify_discord_success(account_config, spec_label, target_region, public_ip, instance_id, oci_username)
+
                 target_tg_chat = telegram_chat_id or get_active_chat_id()
                 if telegram_bot_token and target_tg_chat:
                     instance_name = account_config.get('display_name', 'AlwaysFree-Bot')
@@ -1445,7 +1512,7 @@ def run_automated_creation(config, account_config, compute_client, network_clien
                 msg = str(e)
                 code = getattr(e, 'code', 'N/A')
                 status = getattr(e, 'status', 'N/A')
-                add_log(f"Debug -> ServiceError code={code}, status={status}, msg={e.message[:120]}")
+                add_log(f"Debug -> ServiceError code={code}, status={status}, msg={getattr(e, 'message', msg)[:120]}")
                 if "TooManyRequests" in msg or status == 429:
                     is_429 = True
                     consecutive_429 += 1
@@ -1465,43 +1532,46 @@ def run_automated_creation(config, account_config, compute_client, network_clien
                         ad_index += 1
                         next_ad = ad_list[ad_index % len(ad_list)]
                         add_log(f"Switching to next AD: '{next_ad}'")
+                elif "LimitExceeded" in code or "limit" in msg.lower() or status == 400:
+                    consecutive_429 = 0
+                    with stats_lock:
+                        automation_stats["error_count"] += 1
+                        automation_stats["last_status"] = f"Quota Busy/Throttled (400)"
+                    user_info = f" [user: {oci_username}]" if oci_username else ""
+                    add_log(f"OCI limit/busy notice (400) for [{spec_label}].{user_info} Continuing 24/7 retries...")
+                    if len(ad_list) > 1:
+                        ad_index += 1
                 elif "NotAuthorizedOrNotFound" in msg or "Authorization failed" in msg or status == 404:
+                    consecutive_429 = 0
                     with stats_lock:
                         automation_stats["error_count"] += 1
-                        automation_stats["last_status"] = "Auth/NotFound error"
-                    add_log(f"Auth/NotFound error — possible causes:")
-                    add_log(f"  1. Image {image_id[:25]}... not found in AD {current_ad}")
-                    add_log(f"  2. Shape {account_config['shape']} not available in this AD")
-                    add_log(f"  3. Subnet {subnet_id[:25]}... missing permissions")
-                    add_log(f"  4. Check OCI Console > Instances > Create — test manually")
+                        automation_stats["last_status"] = "Auth/Resource Notice (404)"
+                    add_log(f"Resource/Auth notice (404) in AD '{current_ad}': {getattr(e, 'message', msg)[:100]}. Continuing 24/7 retries...")
                     if len(ad_list) > 1:
                         ad_index += 1
-                        add_log(f"Trying next AD...")
-                        continue
-                    break
                 else:
+                    consecutive_429 = 0
                     with stats_lock:
                         automation_stats["error_count"] += 1
-                        automation_stats["last_status"] = f"OCI Error: {e.message[:50]}"
-                    add_log(f"OCI API error: {e.message}")
+                        automation_stats["last_status"] = f"OCI Service Notice ({status}/{code})"
+                    add_log(f"OCI API notice ({status}/{code}): {getattr(e, 'message', msg)[:120]}. Continuing 24/7 retries...")
                     if len(ad_list) > 1:
                         ad_index += 1
-                        add_log(f"Trying next AD...")
-                        continue
-                    break
             except (ConnectionError, OSError) as e:
                 consecutive_429 = 0
                 user_info = f" [user: {oci_username}]" if oci_username else ""
-                add_log(f"Connection issue in '{target_region}': {type(e).__name__}.{user_info} Retrying...")
+                add_log(f"Connection glitch in '{target_region}': {type(e).__name__}.{user_info} Continuing 24/7 retries...")
+                with stats_lock:
+                    automation_stats["error_count"] += 1
+                    automation_stats["last_status"] = f"Connection Glitch ({type(e).__name__})"
             except Exception as e:
                 consecutive_429 = 0
                 msg = str(e)
-                if "Remote end closed connection" in msg or "Connection aborted" in msg or "timeout" in msg.lower():
-                    user_info = f" [user: {oci_username}]" if oci_username else ""
-                    add_log(f"Network hiccup in '{target_region}': connection dropped.{user_info} Retrying...")
-                else:
-                    add_log(f"Automation engine failure: {msg}")
-                    break
+                user_info = f" [user: {oci_username}]" if oci_username else ""
+                add_log(f"Transient glitch in '{target_region}': {msg[:100]}.{user_info} Continuing 24/7 retries...")
+                with stats_lock:
+                    automation_stats["error_count"] += 1
+                    automation_stats["last_status"] = f"Transient Glitch ({type(e).__name__})"
             actual_delay = retry_delay
             if randomize_delay:
                 actual_delay = random.randint(random_min, random_max)
@@ -1511,6 +1581,7 @@ def run_automated_creation(config, account_config, compute_client, network_clien
                 add_log(f"Rate limit guard: backing off for {actual_delay}s to allow API token bucket to reset...")
             else:
                 add_log(f"Dynamic retry: waiting {actual_delay}s (randomized {random_min}-{random_max}s)")
+            trigger_discord_dashboard_update()
             if stop_event.wait(actual_delay):
                 add_log("Provisioning loop stopped while waiting.")
                 break
@@ -1564,6 +1635,7 @@ def run_automated_creation(config, account_config, compute_client, network_clien
             automation_shape = None
         with stats_lock:
             automation_stats["running"] = False
+        trigger_discord_dashboard_update()
 
 
 @app.route('/api/free-tier-status', methods=['POST'])
@@ -1597,7 +1669,7 @@ def get_status():
 
 
 def start_snatcher_loop(data, source="api"):
-    global automation_running, automation_shape, tg_live_enabled, tg_live_bot_token, tg_live_chat_id, loop_stop_reason
+    global automation_running, automation_desired, automation_shape, tg_live_enabled, tg_live_bot_token, tg_live_chat_id, loop_stop_reason
     if not data or not data.get('user') or not data.get('private_key'):
         return False, "No valid configuration found. Please configure the snatcher from the web UI first."
 
@@ -1631,6 +1703,7 @@ def start_snatcher_loop(data, source="api"):
             if automation_shape and automation_shape != requested_shape:
                 return False, f"A provisioning loop is already running for shape '{automation_shape}'. Stop it first before starting '{requested_shape}'."
             return False, "A provisioning loop is already running."
+        automation_desired = True
         automation_running = True
         automation_shape = requested_shape
         stop_event.clear()
@@ -1649,36 +1722,46 @@ def start_snatcher_loop(data, source="api"):
         tz = data.get('timezone', 'Asia/Jakarta')
         set_user_tz(tz)
 
-        skip_start_alert = (source == "telegram")
+        skip_start_alert = (source in ("telegram", "discord", "auto_resume", "watchdog"))
 
         thread = threading.Thread(
             target=run_automated_creation,
             args=(config, data, compute_client, network_client, identity_client,
                   retry_delay, randomize_delay, random_min, random_max,
                   bot_token, chat_id, tz, skip_start_alert),
-            daemon=True
+            daemon=True,
+            name="SnatcherCreationWorker"
         )
         thread.start()
 
         save_active_config(data)
+        trigger_discord_dashboard_update()
 
         return True, "Provisioning loop started." + (" Live Telegram logging enabled." if tg_live_enabled else "")
     except Exception as e:
         with automation_lock:
             automation_running = False
             automation_shape = None
+        trigger_discord_dashboard_update()
         return False, str(e)
 
 
 def stop_snatcher_loop(source="web"):
-    global tg_live_enabled, loop_stop_reason
+    global tg_live_enabled, loop_stop_reason, automation_desired
     with automation_lock:
         if not automation_running:
+            automation_desired = False
+            trigger_discord_dashboard_update()
             return False, "Provisioning loop is not currently running."
+        automation_desired = False
         loop_stop_reason = source
     stop_event.set()
     with tg_live_lock:
         tg_live_enabled = False
+    with stats_lock:
+        automation_stats["running"] = False
+        automation_stats["last_status"] = f"Paused by user ({source})"
+    trigger_discord_dashboard_update()
     return True, "Stop signal sent."
 
 
@@ -2278,6 +2361,457 @@ def start_telegram_bot_listener():
     t.start()
 
 
+# ==============================================================================
+# ---- Discord Bot Engine & Anti-Spam Interactive Control ----
+# ==============================================================================
+
+def html_to_discord_markdown(text):
+    if not text:
+        return ""
+    s = text
+    s = s.replace("<b>", "**").replace("</b>", "**")
+    s = s.replace("<i>", "*").replace("</i>", "*")
+    s = s.replace("<code>", "`").replace("</code>", "`")
+    s = s.replace("&bull;", "•").replace("&#9989;", "✅").replace("&#10060;", "❌")
+    s = html.unescape(s)
+    return s
+
+
+def build_discord_dashboard_embed():
+    tz = get_user_tz(get_current_tz())
+    now_dt = datetime.datetime.now(tz)
+    with stats_lock:
+        st = automation_stats.copy()
+    with automation_lock:
+        running = automation_running
+
+    if st.get("success"):
+        color = 0xFFD700  # Gold
+        status_text = "🎉 Successfully Provisioned!"
+    elif running:
+        color = 0x2ECC71  # Emerald Green
+        status_text = "🟢 Snatching 24/7 (Continuous)"
+    else:
+        color = 0xF1C40F  # Amber / Yellow
+        status_text = "⏸️ Paused (Standby)"
+
+    uptime_str = "0m"
+    if st.get("start_time"):
+        elapsed_sec = int(time.time() - st["start_time"])
+        days = elapsed_sec // 86400
+        hours = (elapsed_sec % 86400) // 3600
+        minutes = (elapsed_sec % 3600) // 60
+        uptime_str = f"{days}d {hours}h {minutes}m" if days > 0 else (f"{hours}h {minutes}m" if hours > 0 else f"{minutes}m")
+
+    embed = discord.Embed(
+        title="⚡ Oracle Cloud A1 VM Snatcher — 24/7 Sentinel",
+        description="Continuous Always-Free Ampere A1 VM capacity harvester.",
+        color=color
+    )
+
+    embed.add_field(name="Engine Status", value=status_text, inline=True)
+    embed.add_field(name="Target Instance", value=st.get('target_name', 'AlwaysFree-ARM'), inline=True)
+    embed.add_field(name="Shape", value=f"`{st.get('shape', 'VM.Standard.A1.Flex')}`", inline=True)
+
+    specs_str = st.get('specs_mode') or f"{st.get('ocpus', 4)} OCPU / {st.get('memory_gb', 24)} GB"
+    curr_spec = st.get('current_spec_label') or "4 OCPU / 24 GB"
+    embed.add_field(name="Specs Mode", value=specs_str, inline=True)
+    embed.add_field(name="Current Spec Attempt", value=curr_spec, inline=True)
+    region_val = f"`{st.get('region', 'ap-singapore-1')}`\n({(st.get('ad') or 'AD-1')[:30]})"
+    embed.add_field(name="Region & Zone", value=region_val, inline=True)
+
+    total_attempts = st.get('total_attempts', 0)
+    attempts_today = st.get('attempts_today', 0)
+    embed.add_field(name="Total Attempts", value=f"`{total_attempts:,}`", inline=True)
+    embed.add_field(name="Attempts Today", value=f"`{attempts_today:,}`", inline=True)
+    embed.add_field(name="Engine Uptime", value=f"`{uptime_str}`", inline=True)
+
+    busy_500 = st.get('capacity_busy_count', 0)
+    rate_429 = st.get('rate_limit_count', 0)
+    embed.add_field(name="Capacity Busy (500)", value=f"`{busy_500:,}`", inline=True)
+    embed.add_field(name="Rate Limited (429)", value=f"`{rate_429:,}`", inline=True)
+    embed.add_field(name="Cadence", value="`60–90s jitter`", inline=True)
+
+    # Activity preview snippet
+    with logs_lock:
+        recent = list(global_logs)[-2:]
+    recent_str = "\n".join(recent) if recent else "Initializing..."
+    if len(recent_str) > 280:
+        recent_str = recent_str[-280:]
+    embed.add_field(name="Latest Activity", value=f"```text\n{recent_str}\n```", inline=False)
+
+    time_str = now_dt.strftime('%H:%M:%S %Z')
+    embed.set_footer(text=f"Anti-Spam Interactive Control • Channel #oracle-vm • Updated: {time_str}")
+    return embed
+
+
+class SnatcherDashboardView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=None)
+        self.update_buttons()
+
+    def update_buttons(self):
+        self.clear_items()
+        with automation_lock:
+            running = automation_running
+
+        # Toggle Button: Red Pause if running, Green Resume if paused
+        if running:
+            toggle_btn = discord.ui.Button(
+                label="Pause",
+                style=discord.ButtonStyle.danger,
+                emoji="⏸️",
+                custom_id="snatcher_btn_toggle"
+            )
+        else:
+            toggle_btn = discord.ui.Button(
+                label="Resume",
+                style=discord.ButtonStyle.success,
+                emoji="▶️",
+                custom_id="snatcher_btn_toggle"
+            )
+        toggle_btn.callback = self.on_toggle_click
+        self.add_item(toggle_btn)
+
+        # Refresh Status Button: Primary (Blurple)
+        refresh_btn = discord.ui.Button(
+            label="Refresh Status",
+            style=discord.ButtonStyle.primary,
+            emoji="🔄",
+            custom_id="snatcher_btn_refresh"
+        )
+        refresh_btn.callback = self.on_refresh_click
+        self.add_item(refresh_btn)
+
+        # Recent Logs Button: Secondary (Gray)
+        logs_btn = discord.ui.Button(
+            label="Recent Logs",
+            style=discord.ButtonStyle.secondary,
+            emoji="📋",
+            custom_id="snatcher_btn_logs"
+        )
+        logs_btn.callback = self.on_logs_click
+        self.add_item(logs_btn)
+
+        # Daily Report Button: Secondary (Gray)
+        daily_btn = discord.ui.Button(
+            label="Daily Report",
+            style=discord.ButtonStyle.secondary,
+            emoji="📊",
+            custom_id="snatcher_btn_daily"
+        )
+        daily_btn.callback = self.on_daily_click
+        self.add_item(daily_btn)
+
+        # Health Ping Button: Secondary (Gray)
+        ping_btn = discord.ui.Button(
+            label="Health Ping",
+            style=discord.ButtonStyle.secondary,
+            emoji="🏓",
+            custom_id="snatcher_btn_ping"
+        )
+        ping_btn.callback = self.on_ping_click
+        self.add_item(ping_btn)
+
+    async def on_toggle_click(self, interaction: discord.Interaction):
+        with automation_lock:
+            running = automation_running
+        if running:
+            stop_snatcher_loop(source="discord")
+        else:
+            cfg = get_saved_config()
+            if not cfg:
+                await interaction.response.send_message("❌ No saved configuration found. Please save config via Web UI.", ephemeral=True)
+                return
+            ok, msg = start_snatcher_loop(cfg, source="discord")
+            if not ok:
+                await interaction.response.send_message(f"❌ Could not resume: {msg}", ephemeral=True)
+                return
+
+        self.update_buttons()
+        embed = build_discord_dashboard_embed()
+        await interaction.response.edit_message(embed=embed, view=self)
+
+    async def on_refresh_click(self, interaction: discord.Interaction):
+        self.update_buttons()
+        embed = build_discord_dashboard_embed()
+        await interaction.response.edit_message(embed=embed, view=self)
+
+    async def on_logs_click(self, interaction: discord.Interaction):
+        with logs_lock:
+            logs_list = list(global_logs)
+        recent = logs_list[-12:] if logs_list else ["No logs recorded yet."]
+        logs_clean = "\n".join(recent)
+        if len(logs_clean) > 1850:
+            logs_clean = "..." + logs_clean[-1850:]
+        await interaction.response.send_message(
+            f"📋 **Recent Snatcher Activity Logs (last {len(recent)} entries):**\n```text\n{logs_clean}\n```",
+            ephemeral=True
+        )
+
+    async def on_daily_click(self, interaction: discord.Interaction):
+        report_text = generate_daily_report_text()
+        report_md = html_to_discord_markdown(report_text)
+        if len(report_md) > 1900:
+            report_md = report_md[:1900] + "..."
+        await interaction.response.send_message(report_md, ephemeral=True)
+
+    async def on_ping_click(self, interaction: discord.Interaction):
+        global discord_client
+        latency_ms = int(discord_client.latency * 1000) if discord_client else 0
+        with automation_lock:
+            running = automation_running
+        state_str = "🟢 24/7 Monitoring" if running else "⏸️ Paused"
+        mem_mb = get_mem_usage_mb()
+        await interaction.response.send_message(
+            f"🏓 **Pong!**\n• Bot Latency: `{latency_ms} ms`\n• Snatcher State: `{state_str}`\n• Host Memory: `{mem_mb} MB`\n• Anti-Spam: `Active (Pinned In-Place Dashboard)`",
+            ephemeral=True
+        )
+
+
+class SnatcherDiscordClient(discord.Client):
+    def __init__(self):
+        intents = discord.Intents.default()
+        try:
+            intents.message_content = True
+        except Exception:
+            pass
+        super().__init__(intents=intents)
+        self.dashboard_message = None
+        self.dashboard_view = None
+        self.target_channel_id = get_discord_channel_id()
+
+    async def on_ready(self):
+        add_log(f"[Discord] Logged in as {self.user} (ID: {self.user.id})")
+        self.dashboard_view = SnatcherDashboardView()
+        self.add_view(self.dashboard_view)
+        await self.setup_dashboard()
+        if not self.auto_update_task.is_running():
+            self.auto_update_task.start()
+
+    async def setup_dashboard(self):
+        try:
+            self.target_channel_id = get_discord_channel_id()
+            channel = self.get_channel(self.target_channel_id)
+            if not channel:
+                try:
+                    channel = await self.fetch_channel(self.target_channel_id)
+                except Exception as e:
+                    add_log(f"[Discord] Could not fetch channel {self.target_channel_id}: {e}")
+                    return
+
+            embed = build_discord_dashboard_embed()
+            if self.dashboard_view:
+                self.dashboard_view.update_buttons()
+            else:
+                self.dashboard_view = SnatcherDashboardView()
+
+            # Look through recent messages for existing dashboard message to reuse
+            existing_msg = None
+            try:
+                async for msg in channel.history(limit=25):
+                    if msg.author == self.user and msg.embeds:
+                        if "Oracle Cloud A1 VM Snatcher" in (msg.embeds[0].title or ""):
+                            existing_msg = msg
+                            break
+            except Exception as e:
+                add_log(f"[Discord] Error scanning channel history: {e}")
+
+            if existing_msg:
+                self.dashboard_message = existing_msg
+                await existing_msg.edit(embed=embed, view=self.dashboard_view)
+                add_log(f"[Discord] Pinned dashboard reused & updated: {existing_msg.id}")
+            else:
+                new_msg = await channel.send(embed=embed, view=self.dashboard_view)
+                self.dashboard_message = new_msg
+                add_log(f"[Discord] New dashboard message posted in #{channel.name}: {new_msg.id}")
+
+        except Exception as e:
+            add_log(f"[Discord] Failed to setup dashboard message: {e}")
+
+    @tasks.loop(seconds=60)
+    async def auto_update_task(self):
+        if not self.is_ready():
+            return
+        await self.update_dashboard_now()
+
+    @auto_update_task.before_loop
+    async def before_auto_update(self):
+        await self.wait_until_ready()
+
+    async def update_dashboard_now(self):
+        if not self.is_ready():
+            return
+        try:
+            self.target_channel_id = get_discord_channel_id()
+            channel = self.get_channel(self.target_channel_id)
+            if not channel:
+                channel = await self.fetch_channel(self.target_channel_id)
+            if not channel:
+                return
+
+            embed = build_discord_dashboard_embed()
+            if self.dashboard_view:
+                self.dashboard_view.update_buttons()
+            else:
+                self.dashboard_view = SnatcherDashboardView()
+
+            if self.dashboard_message:
+                try:
+                    await self.dashboard_message.edit(embed=embed, view=self.dashboard_view)
+                    return
+                except discord.NotFound:
+                    self.dashboard_message = None
+                except Exception:
+                    self.dashboard_message = None
+
+            # If no cached message, find or create
+            existing_msg = None
+            try:
+                async for msg in channel.history(limit=25):
+                    if msg.author == self.user and msg.embeds:
+                        if "Oracle Cloud A1 VM Snatcher" in (msg.embeds[0].title or ""):
+                            existing_msg = msg
+                            break
+            except Exception:
+                pass
+
+            if existing_msg:
+                self.dashboard_message = existing_msg
+                await existing_msg.edit(embed=embed, view=self.dashboard_view)
+            else:
+                self.dashboard_message = await channel.send(embed=embed, view=self.dashboard_view)
+
+        except Exception as e:
+            add_log(f"[Discord] Dashboard update note: {e}")
+
+    async def send_success_alert(self, account_config, spec_label, target_region, public_ip, instance_id, oci_username):
+        try:
+            self.target_channel_id = get_discord_channel_id()
+            channel = self.get_channel(self.target_channel_id)
+            if not channel:
+                channel = await self.fetch_channel(self.target_channel_id)
+            if not channel:
+                return
+
+            instance_name = account_config.get('display_name', 'AlwaysFree-ARM')
+            shape = account_config.get('shape', 'VM.Standard.A1.Flex')
+            user_line = f"• **User:** `{oci_username}`\n" if oci_username else ""
+            ip_val = f"`{public_ip}`" if public_ip else "Allocating..."
+
+            alert_embed = discord.Embed(
+                title="🎉 ORACLE A1 VM SNATCHED SUCCESSFULLY!",
+                description="Your Always Free Ampere A1 ARM compute instance has been provisioned!",
+                color=0xFFD700
+            )
+            alert_embed.add_field(name="Instance Name", value=instance_name, inline=True)
+            alert_embed.add_field(name="Shape & Specs", value=f"{shape}\n({spec_label})", inline=True)
+            alert_embed.add_field(name="Public IP", value=ip_val, inline=True)
+            alert_embed.add_field(name="Region", value=f"`{target_region}`", inline=True)
+            alert_embed.add_field(name="Instance ID", value=f"`{instance_id[:32]}...`", inline=True)
+            alert_embed.add_field(
+                name="Quick SSH Connect",
+                value=f"```bash\nssh -i <your_key> ubuntu@{public_ip}\n```" if public_ip else "Check OCI Console",
+                inline=False
+            )
+            alert_embed.set_footer(text="Oracle A1 VM Snatcher • Provisioning Complete")
+
+            await channel.send(
+                content="@everyone 🚀 **Always Free Oracle A1 VM Captured!**",
+                embed=alert_embed
+            )
+            await self.update_dashboard_now()
+        except Exception as e:
+            add_log(f"[Discord] Failed to send success alert: {e}")
+
+    async def on_message(self, message):
+        if message.author == self.user or message.author.bot:
+            return
+        if message.channel.id != self.target_channel_id:
+            return
+
+        cmd = message.content.strip().lower()
+        if cmd in ("!status", "!refresh", "/status", "status", "!dashboard"):
+            await self.update_dashboard_now()
+            try:
+                await message.delete(delay=2)
+            except Exception:
+                pass
+        elif cmd in ("!pause", "/pause", "pause", "!stop", "/stop"):
+            stop_snatcher_loop(source="discord")
+            await self.update_dashboard_now()
+            try:
+                await message.delete(delay=2)
+            except Exception:
+                pass
+        elif cmd in ("!resume", "/resume", "resume", "!start", "/start", "start"):
+            cfg = get_saved_config()
+            if cfg:
+                start_snatcher_loop(cfg, source="discord")
+            await self.update_dashboard_now()
+            try:
+                await message.delete(delay=2)
+            except Exception:
+                pass
+
+
+def _run_discord_bot_thread():
+    token = get_discord_bot_token()
+    if not token:
+        add_log("[Discord] No bot token configured, skipping Discord bot listener.")
+        return
+    add_log("[Discord] Starting Discord bot listener in background thread...")
+
+    global discord_client, discord_loop
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    discord_loop = loop
+
+    while True:
+        try:
+            discord_client = SnatcherDiscordClient()
+            loop.run_until_complete(discord_client.start(token))
+        except Exception as e:
+            add_log(f"[Discord] Bot client stopped: {e}. Reconnecting in 10s...")
+            time.sleep(10)
+
+
+def start_discord_bot():
+    t = threading.Thread(target=_run_discord_bot_thread, daemon=True, name="DiscordBotListener")
+    t.start()
+
+
+# ==============================================================================
+# ---- 24/7 Watchdog Supervisor ----
+# ==============================================================================
+
+def _watchdog_supervisor():
+    add_log("[24/7 Watchdog] Supervisor thread active and monitoring snatcher engine.")
+    while True:
+        time.sleep(20)
+        with automation_lock:
+            desired = automation_desired
+            running = automation_running
+        with stats_lock:
+            succeeded = automation_stats.get("success", False)
+
+        if desired and not running and not succeeded:
+            cfg = get_saved_config()
+            if cfg and cfg.get('user') and cfg.get('private_key'):
+                add_log("[24/7 Watchdog] Snatcher loop was inactive while desired=True. Auto-reviving 24/7 snatcher loop...")
+                ok, msg = start_snatcher_loop(cfg, source="watchdog")
+                if ok:
+                    add_log("[24/7 Watchdog] Snatcher loop revived successfully.")
+                    trigger_discord_dashboard_update()
+                else:
+                    add_log(f"[24/7 Watchdog] Revive attempt notice: {msg}")
+
+
+def start_snatcher_watchdog():
+    t = threading.Thread(target=_watchdog_supervisor, daemon=True, name="SnatcherWatchdog")
+    t.start()
+
+
 # Auto-initialize services once per process
 _services_started = False
 _services_lock = threading.Lock()
@@ -2292,5 +2826,7 @@ def init_background_services():
     auto_resume_saved_config()
     start_periodic_updater()
     start_telegram_bot_listener()
+    start_discord_bot()
+    start_snatcher_watchdog()
 
 init_background_services()
